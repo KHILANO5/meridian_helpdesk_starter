@@ -42,7 +42,7 @@ The scope of this code review encompasses the entire backend codebase and databa
 | Finding ID | Title | Severity | Status | Selected for Part 1 Fix |
 | :--- | :--- | :---: | :---: | :---: |
 | **F-01** | Unauthenticated Account Takeover & Plaintext Password Storage | **Critical** | **Fixed** | **Yes** |
-| **F-02** | SQL Injection via Unsanitized `sortBy` and `order` Parameters | **Critical** | Confirmed | **Yes** |
+| **F-02** | SQL Injection via Unsanitized `sortBy` and `order` Parameters | **Critical** | **Fixed** | **Yes** |
 | **F-03** | Cross-Tenant Ticket & Comment Disclosure (IDOR) on `GET /:id` | **Critical** | Confirmed | **Yes** |
 | **F-04** | Unauthorized and Cross-Tenant Ticket Claiming (`PATCH /:id/assign`) | **High** | Confirmed | **Yes** |
 | **F-05** | Internal Agent Notes (`is_internal`) Leaked to Requesters | **High** | Confirmed | **Yes** |
@@ -106,11 +106,11 @@ The scope of this code review encompasses the entire backend codebase and databa
 - **Finding ID**: `F-02`
 - **Title**: SQL Injection via Unsanitized `sortBy` and `order` in Ticket Listing
 - **Severity**: Critical
-- **Confirmed Status**: Confirmed
+- **Confirmed Status**: Confirmed (Remediation: **Fixed**)
 - **Selected Status**: Selected
 - **Exact File Paths & Lines**: 
   - `server/src/routes/tickets.js` (Lines 22–24)
-  - `server/src/services/ticketService.js` (Line 38)
+  - `server/src/services/ticketService.js` (Lines 2–20, 30–36)
 - **Route / Function Name**: `listTickets()` / `GET /api/tickets`
 - **Relevant Code Snippet**:
   ```javascript
@@ -118,7 +118,7 @@ The scope of this code review encompasses the entire backend codebase and databa
   sortBy: req.query.sortBy || 'created_at',
   order: req.query.order || 'desc',
 
-  // server/src/services/ticketService.js
+  // server/src/services/ticketService.js (original vulnerable query)
   const rows = await query(
     `SELECT t.id, t.subject, t.status, t.priority, t.created_at, t.updated_at,
             t.assignee_id, u.name AS assignee_name, r.name AS requester_name
@@ -132,13 +132,13 @@ The scope of this code review encompasses the entire backend codebase and databa
   );
   ```
 - **Problem Explanation**: 
-  User-supplied query parameters `sortBy` and `order` are directly concatenated into the SQL template string without validation or sanitization. Because MySQL prepared statement placeholders (`?`) do not support dynamic identifiers or keywords in `ORDER BY`, string interpolation without a strict whitelist creates an injection point.
+  User-supplied query parameters `sortBy` and `order` were directly concatenated into the SQL template string without validation or sanitization. Because MySQL prepared statement placeholders (`?`) do not support dynamic identifiers or keywords in `ORDER BY`, string interpolation without a strict whitelist created an injection point.
 - **Security / Business Impact**: 
-  Authenticated users can inject arbitrary SQL expressions into the `ORDER BY` clause, allowing database fingerprinting, potential data exfiltration via boolean/time-based inference, and database Denial of Service.
+  Authenticated users could inject arbitrary SQL expressions into the `ORDER BY` clause, allowing database fingerprinting, potential data exfiltration via boolean/time-based inference, and database Denial of Service.
 - **Safe Reproduction Steps**:
   1. Authenticate to obtain a valid JWT token.
   2. Issue a request to `GET /api/tickets?sortBy=created_at%20AND%201=1` or `GET /api/tickets?order=DESC,%20(SELECT%201)`.
-  3. Observe that arbitrary expressions are parsed and evaluated directly by MySQL.
+  3. Observe that arbitrary expressions were parsed and evaluated directly by MySQL.
 - **Recommended Fix**:
   Implement a strict whitelist validation for allowed sorting columns and directions:
   ```javascript
@@ -151,6 +151,33 @@ The scope of this code review encompasses the entire backend codebase and databa
   const safeSortBy = ALLOWED_SORT_COLUMNS[sortBy] || 't.created_at';
   const safeOrder = String(order).toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
   ```
+- **Remediation Note (Fixed)**:
+  - **Root Cause**: Raw query parameters `sortBy` and `order` were interpolated directly into the SQL string template (`ORDER BY t.${sortBy} ${order}`) without validation or sanitization against SQL injection.
+  - **Files Changed**:
+    - `server/src/services/ticketService.js`: Implemented `SORT_FIELDS` allowlist mapping (`created_at`, `createdAt`, `updated_at`, `updatedAt`, `priority`, `status`, `id`) to fixed SQL column identifiers (`t.created_at`, `t.updated_at`, etc.), and `SORT_ORDERS` allowlist (`asc` -> `'ASC'`, `desc` -> `'DESC'`).
+  - **Allowlist Design**:
+    ```javascript
+    const SORT_FIELDS = {
+      created_at: 't.created_at',
+      createdAt: 't.created_at',
+      updated_at: 't.updated_at',
+      updatedAt: 't.updated_at',
+      priority: 't.priority',
+      status: 't.status',
+      id: 't.id',
+    };
+    const SORT_ORDERS = { asc: 'ASC', desc: 'DESC' };
+    ```
+  - **Safe Defaults**: Any unlisted or invalid `sortBy` value falls back safely to `'t.created_at'`. Any unlisted or invalid `order` value falls back safely to `'DESC'`. Raw user input is never interpolated into the SQL statement.
+  - **Actual Tests Run**: Executed automated test suite `server/test-sorting-verification.js` covering 45 assertions:
+    - Default sorting returns 200 OK with valid ticket rows.
+    - Every supported sort field (`created_at`, `updated_at`, `priority`, `status`, `id`, `createdAt`, `updatedAt`) verified.
+    - Both `asc` and `desc` directions verified for correct chronological ordering.
+    - Invalid sort fields (e.g. `unknown_field`, `created_at, id`) safely fallback to default without error or query alteration.
+    - Invalid sort directions (e.g. `sideways`, `desc, id`) safely fallback to `DESC`.
+    - Injection-like inputs (`-- comment`, `1;SELECT 1`, `users.name`, etc.) safely handled with 200 OK and no SQL errors or stack traces exposed.
+    - Standard ticket filtering (`status`, `priority`) and pagination preserved.
+  - **Actual Test Results**: 45 passed, 0 failed.
 
 ---
 
@@ -333,12 +360,12 @@ The following genuine findings were documented during review but deferred to ens
 | Finding ID | Title | Unit Test Status | Integration Test Status | Manual Verification |
 | :---: | :--- | :---: | :---: | :---: |
 | **F-01** | Account Takeover in Invite Accept | **Passed** (22/22 assertions in `test-invite-verification.js`) | **Passed** | Confirmed & Verified |
-| **F-02** | SQL Injection via `sortBy`/`order` | Not yet tested | Not yet tested | Confirmed via code review |
+| **F-02** | SQL Injection via `sortBy`/`order` | **Passed** (45/45 assertions in `test-sorting-verification.js`) | **Passed** | Confirmed & Verified |
 | **F-03** | Cross-Tenant Ticket Access | Not yet tested | Not yet tested | Confirmed via code review |
 | **F-04** | Unauthorized Ticket Assignment | Not yet tested | Not yet tested | Confirmed via code review |
 | **F-05** | Internal Notes Disclosure | Not yet tested | Not yet tested | Confirmed via code review |
 
-*Note: F-01 has been remediated and fully verified. Findings F-02 through F-05 remain in pre-implementation status pending their respective remediation tasks.*
+*Note: F-01 and F-02 have been remediated and fully verified. Findings F-03 through F-05 remain in pre-implementation status pending their respective remediation tasks.*
 
 ---
 

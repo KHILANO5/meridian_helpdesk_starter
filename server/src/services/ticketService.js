@@ -2,6 +2,21 @@ import { query } from '../db/pool.js';
 
 const PAGE_SIZE = 20;
 
+const SORT_FIELDS = {
+  created_at: 't.created_at',
+  createdAt: 't.created_at',
+  updated_at: 't.updated_at',
+  updatedAt: 't.updated_at',
+  priority: 't.priority',
+  status: 't.status',
+  id: 't.id',
+};
+
+const SORT_ORDERS = {
+  asc: 'ASC',
+  desc: 'DESC',
+};
+
 /**
  * Paginated ticket list for the current organisation.
  *
@@ -28,6 +43,10 @@ export async function listTickets({ orgId, page = 1, search = '', status, priori
   const whereSql = where.join(' AND ');
   const offset = page * PAGE_SIZE;
 
+  // Strict allowlist validation and safe defaults to eliminate SQL injection
+  const safeSortField = SORT_FIELDS[sortBy] || 't.created_at';
+  const safeOrder = SORT_ORDERS[String(order).toLowerCase()] || 'DESC';
+
   const rows = await query(
     `SELECT t.id, t.subject, t.status, t.priority, t.created_at, t.updated_at,
             t.assignee_id, u.name AS assignee_name, r.name AS requester_name
@@ -35,7 +54,7 @@ export async function listTickets({ orgId, page = 1, search = '', status, priori
        LEFT JOIN users u ON u.id = t.assignee_id
        JOIN users r ON r.id = t.requester_id
       WHERE ${whereSql}
-      ORDER BY t.${sortBy} ${order}
+      ORDER BY ${safeSortField} ${safeOrder}
       LIMIT ? OFFSET ?`,
     [...params, PAGE_SIZE, offset]
   );
