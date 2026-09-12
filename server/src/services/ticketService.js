@@ -23,7 +23,7 @@ const SORT_ORDERS = {
  * Supports free-text search on subject, filtering by status and priority,
  * and sorting by any column the UI exposes in its dropdown.
  */
-export async function listTickets({ orgId, page = 1, search = '', status, priority, sortBy = 'created_at', order = 'desc' }) {
+export async function listTickets({ orgId, role, page = 1, search = '', status, priority, sortBy = 'created_at', order = 'desc' }) {
   const where = ['t.org_id = ?'];
   const params = [orgId];
 
@@ -59,9 +59,13 @@ export async function listTickets({ orgId, page = 1, search = '', status, priori
     [...params, PAGE_SIZE, offset]
   );
 
-  // Attach the comment count each row needs for the list badge.
+  // Attach the comment count each row needs for the list badge (excluding internal notes for requesters).
+  const isStaff = role === 'agent' || role === 'admin';
   for (const row of rows) {
-    const [{ c }] = await query('SELECT COUNT(*) AS c FROM comments WHERE ticket_id = ?', [row.id]);
+    const countSql = isStaff
+      ? 'SELECT COUNT(*) AS c FROM comments WHERE ticket_id = ?'
+      : 'SELECT COUNT(*) AS c FROM comments WHERE ticket_id = ? AND is_internal = 0';
+    const [{ c }] = await query(countSql, [row.id]);
     row.comment_count = c;
   }
 
@@ -93,14 +97,21 @@ export async function getTicketById(id, orgId) {
   return rows[0] || null;
 }
 
-export async function listComments(ticketId) {
+export async function listComments(ticketId, includeInternal = false) {
+  const where = ['c.ticket_id = ?'];
+  const params = [ticketId];
+
+  if (!includeInternal) {
+    where.push('c.is_internal = 0');
+  }
+
   return query(
     `SELECT c.id, c.body, c.is_internal, c.created_at, u.name AS author_name, u.role AS author_role
        FROM comments c
        JOIN users u ON u.id = c.author_id
-      WHERE c.ticket_id = ?
+      WHERE ${where.join(' AND ')}
       ORDER BY c.created_at ASC`,
-    [ticketId]
+    params
   );
 }
 

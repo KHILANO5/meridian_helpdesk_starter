@@ -15,6 +15,7 @@ router.get('/', requireAuth, async (req, res, next) => {
   try {
     const result = await listTickets({
       orgId: req.user.orgId,
+      role: req.user.role,
       page: Number(req.query.page || 1),
       search: req.query.search || '',
       status: req.query.status,
@@ -38,7 +39,8 @@ router.get('/:id', requireAuth, async (req, res, next) => {
     const ticket = await getTicketById(ticketId, req.user.orgId);
     if (!ticket) return res.status(404).json({ error: 'Not found' });
 
-    const comments = await listComments(ticket.id);
+    const isStaff = req.user.role === 'agent' || req.user.role === 'admin';
+    const comments = await listComments(ticket.id, isStaff);
     res.json({ ticket, comments });
   } catch (err) {
     next(err);

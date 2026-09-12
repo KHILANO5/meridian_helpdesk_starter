@@ -45,7 +45,7 @@ The scope of this code review encompasses the entire backend codebase and databa
 | **F-02** | SQL Injection via Unsanitized `sortBy` and `order` Parameters | **Critical** | **Fixed** | **Yes** |
 | **F-03** | Cross-Tenant Ticket & Comment Disclosure (IDOR) on `GET /:id` | **Critical** | **Fixed** | **Yes** |
 | **F-04** | Unauthorized and Cross-Tenant Ticket Claiming (`PATCH /:id/assign`) | **High** | **Fixed** | **Yes** |
-| **F-05** | Internal Agent Notes (`is_internal`) Leaked to Requesters | **High** | Confirmed | **Yes** |
+| **F-05** | Internal Agent Notes (`is_internal`) Leaked to Requesters | **High** | **Fixed** | **Yes** |
 | **F-06** | Missing Admin Role Guard & Org Check on `DELETE /api/tickets/:id` | **High** | Confirmed | No |
 | **F-07** | Off-by-One Pagination Offset Skips First 20 Tickets (Page 1) | **High** | Confirmed | No |
 | **F-08** | Non-Atomic Race Condition in Ticket Assignment Concurrency | **Medium** | Confirmed | No |
@@ -315,14 +315,16 @@ The scope of this code review encompasses the entire backend codebase and databa
 - **Finding ID**: `F-05`
 - **Title**: Information Disclosure of Internal Agent Comments (`is_internal`) to Requesters
 - **Severity**: High
-- **Confirmed Status**: Confirmed
+- **Confirmed Status**: Confirmed (Remediation: **Fixed**)
 - **Selected Status**: Selected
 - **Exact File Paths & Lines**: 
-  - `server/src/services/ticketService.js` (Lines 69–78)
-  - `server/src/routes/tickets.js` (Line 36)
-- **Route / Function Name**: `listComments()` / `GET /api/tickets/:id`
+  - `server/src/services/ticketService.js` (Lines 62–70, Lines 100–116)
+  - `server/src/routes/tickets.js` (Line 18, Lines 42–44)
+  - `server/src/routes/comments.js` (Lines 14–28)
+- **Route / Function Name**: `listComments()` / `listTickets()` / `GET /api/tickets/:id` / `POST /api/tickets/:ticketId/comments`
 - **Relevant Code Snippet**:
   ```javascript
+  // server/src/services/ticketService.js (original vulnerable query)
   export async function listComments(ticketId) {
     return query(
       `SELECT c.id, c.body, c.is_internal, c.created_at, u.name AS author_name, u.role AS author_role
@@ -335,15 +337,15 @@ The scope of this code review encompasses the entire backend codebase and databa
   }
   ```
 - **Problem Explanation**: 
-  `listComments` returns all comment records for a ticket without filtering by `is_internal`. The ticket retrieval endpoint returns this complete list to all authenticated users regardless of their role.
+  `listComments` originally fetched all comment records for a ticket without filtering by `is_internal`. The ticket retrieval endpoint (`GET /api/tickets/:id`) returned this complete list to all authenticated users regardless of their role. Furthermore, `listTickets` counted all comments (including internal notes) on ticket list badge counters, and `POST /api/tickets/:ticketId/comments` accepted `isInternal: true` from requesters without verifying agent/admin role permissions.
 - **Security / Business Impact**: 
-  Private staff discussions, internal diagnostic details, or internal escalation remarks flagged as `is_internal = 1` are leaked directly to end-user requesters.
+  Private staff discussions, internal diagnostic details, credit/dispute notes, or escalation remarks flagged as `is_internal = 1` were leaked directly to end-user customer requesters.
 - **Safe Reproduction Steps**:
-  1. Create or identify an internal note on a ticket (`is_internal: 1`).
+  1. Create or identify an internal note on a ticket (`is_internal = 1`).
   2. Log in as a customer `requester` and fetch `GET /api/tickets/:id`.
-  3. Note that the comment with `is_internal: 1` is returned in the API response JSON.
+  3. The response JSON exposed private internal agent notes and comments to the customer.
 - **Recommended Fix**:
-  Update `listComments` to filter out internal notes when the requesting user is a requester:
+  Update `listComments` to filter out internal notes when the requesting user is a customer requester:
   ```javascript
   export async function listComments(ticketId, includeInternal = false) {
     const where = ['c.ticket_id = ?'];
@@ -361,6 +363,36 @@ The scope of this code review encompasses the entire backend codebase and databa
     );
   }
   ```
+- **Remediation Note (Fixed)**:
+  - **Root Cause**: `listComments()` omitted an `is_internal = 0` condition for customer requesters, unconditionally returning private staff notes to any user authorized to view the ticket. In addition, ticket list badge comment counters counted internal notes for requesters, and the comment creation route accepted `isInternal: true` from unprivileged roles.
+  - **Exact Files Changed**:
+    - `server/src/services/ticketService.js`:
+      - Updated `listComments(ticketId, includeInternal = false)` to accept an `includeInternal` boolean (defaulting to `false`). When `includeInternal` is `false`, it adds `c.is_internal = 0` to the SQL query condition using parameterized arrays.
+      - Updated `listTickets({ orgId, role, ... })` to check whether the user is staff (`isStaff = role === 'agent' || role === 'admin'`). For requesters, `comment_count` executes `SELECT COUNT(*) AS c FROM comments WHERE ticket_id = ? AND is_internal = 0`, preventing indirect leakage of note existence through badge counters.
+    - `server/src/routes/tickets.js`:
+      - In `GET /api/tickets/:id`, inspected `req.user.role` to determine `isStaff = req.user.role === 'agent' || req.user.role === 'admin'`. Passed `isStaff` directly into `listComments(ticket.id, isStaff)`.
+      - In `GET /api/tickets`, forwarded `role: req.user.role` to `listTickets`.
+    - `server/src/routes/comments.js`:
+      - In `POST /api/tickets/:ticketId/comments`, restricted internal note creation to staff (`const markInternal = isStaff && Boolean(isInternal)`). If a customer requester attempts to pass `isInternal: true`, the comment is safely saved with `is_internal = 0`. Also validated tenant ownership via `getTicketById(ticketId, req.user.orgId)`.
+  - **Exact Filtering & Authorization Rules**:
+    - Requesters (`role: 'requester'`) only receive public comments (`is_internal = 0`) when retrieving ticket details.
+    - Staff members (`role: 'agent' | 'admin'`) receive both public comments and internal notes (`is_internal` 0 and 1).
+    - Unauthenticated requests remain blocked by `requireAuth` (401 Unauthorized).
+    - Requesters posting comments cannot create internal notes (`markInternal` forced to 0).
+  - **Actual Tests Run**: Executed automated test suite `server/test-internal-notes-verification.js` covering 25 assertions:
+    - Requester fetching a ticket with both public comments and internal notes receives 200 OK with only public comments (all internal notes omitted, 0 leaks of sensitive text).
+    - Agent fetching the same ticket receives all comments (both public comments and internal notes).
+    - Admin fetching the ticket receives all comments.
+    - Requester attempting to post with `isInternal: true` is forced to `is_internal = 0` in the database.
+    - Agent posting with `isInternal: true` succeeds with `is_internal = 1`.
+    - Ticket listing `comment_count` for requester reflects only public comments (excluding internal notes).
+    - Ticket listing `comment_count` for agent reflects total comments including internal notes.
+    - Unauthenticated requests to ticket details remain blocked with 401 Unauthorized.
+    - Regressions verified: Finding 1 (22/22 passed), Finding 2 (45/45 passed), Finding 3 (21/21 passed), and Finding 4 (23/23 passed).
+  - **Actual Test Results**: 25 passed, 0 failed.
+  - **Assumptions & Limitations**:
+    - Roles permitted to view and post internal notes are `agent` and `admin`. Requesters are strictly confined to public comments.
+    - Direct API responses cannot leak internal notes because filtering is enforced at the database SQL query level via prepared statements.
 
 ---
 
@@ -401,9 +433,9 @@ The following genuine findings were documented during review but deferred to ens
 | **F-02** | SQL Injection via `sortBy`/`order` | **Passed** (45/45 assertions in `test-sorting-verification.js`) | **Passed** | Confirmed & Verified |
 | **F-03** | Cross-Tenant Ticket Access | **Passed** (21/21 assertions in `test-tenant-isolation-verification.js`) | **Passed** | Confirmed & Verified |
 | **F-04** | Unauthorized Ticket Assignment | **Passed** (23/23 assertions in `test-assignment-verification.js`) | **Passed** | Confirmed & Verified |
-| **F-05** | Internal Notes Disclosure | Not yet tested | Not yet tested | Confirmed via code review |
+| **F-05** | Internal Notes Disclosure | **Passed** (25/25 assertions in `test-internal-notes-verification.js`) | **Passed** | Confirmed & Verified |
 
-*Note: F-01, F-02, F-03, and F-04 have been remediated and fully verified. Finding F-05 remains in pre-implementation status pending its respective remediation task.*
+*Note: All top five selected findings (F-01, F-02, F-03, F-04, and F-05) have been remediated, verified with dedicated test suites, and regression tested with 100% pass rates.*
 
 ---
 
