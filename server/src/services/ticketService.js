@@ -1,4 +1,8 @@
 import { pool, query } from '../db/pool.js';
+import { config } from '../config.js';
+import { calculateSla } from './slaService.js';
+
+export { calculateSla };
 
 const PAGE_SIZE = 20;
 
@@ -23,7 +27,7 @@ const SORT_ORDERS = {
  * Supports free-text search on subject, filtering by status and priority,
  * and sorting by any column the UI exposes in its dropdown.
  */
-export async function listTickets({ orgId, role, page = 1, search = '', status, priority, sortBy = 'created_at', order = 'desc' }) {
+export async function listTickets({ orgId, role, page = 1, search = '', status, priority, sortBy = 'created_at', order = 'desc', breached }) {
   const where = ['t.org_id = ?'];
   const params = [orgId];
 
@@ -38,6 +42,17 @@ export async function listTickets({ orgId, role, page = 1, search = '', status, 
   if (priority) {
     where.push('t.priority = ?');
     params.push(priority);
+  }
+  if (breached === true || breached === 'true' || breached === '1') {
+    where.push(
+      `NOW() > DATE_ADD(t.created_at, INTERVAL (CASE t.priority WHEN 'P1' THEN ? WHEN 'P2' THEN ? WHEN 'P3' THEN ? END) HOUR)`
+    );
+    params.push(config.slaTargets.P1, config.slaTargets.P2, config.slaTargets.P3);
+  } else if (breached === false || breached === 'false' || breached === '0') {
+    where.push(
+      `NOW() <= DATE_ADD(t.created_at, INTERVAL (CASE t.priority WHEN 'P1' THEN ? WHEN 'P2' THEN ? WHEN 'P3' THEN ? END) HOUR)`
+    );
+    params.push(config.slaTargets.P1, config.slaTargets.P2, config.slaTargets.P3);
   }
 
   const whereSql = where.join(' AND ');
@@ -59,7 +74,7 @@ export async function listTickets({ orgId, role, page = 1, search = '', status, 
     [...params, PAGE_SIZE, offset]
   );
 
-  // Attach the comment count each row needs for the list badge (excluding internal notes for requesters).
+  // Attach comment count and calculated SLA state for each row
   const isStaff = role === 'agent' || role === 'admin';
   for (const row of rows) {
     const countSql = isStaff
@@ -67,6 +82,10 @@ export async function listTickets({ orgId, role, page = 1, search = '', status, 
       : 'SELECT COUNT(*) AS c FROM comments WHERE ticket_id = ? AND is_internal = 0';
     const [{ c }] = await query(countSql, [row.id]);
     row.comment_count = c;
+
+    // Attach SLA calculation
+    row.sla = calculateSla(row);
+    row.breached = row.sla.breached;
   }
 
   const [{ total }] = await query(
@@ -94,7 +113,12 @@ export async function getTicketById(id, orgId) {
       WHERE ${where.join(' AND ')}`,
     params
   );
-  return rows[0] || null;
+  const ticket = rows[0] || null;
+  if (ticket) {
+    ticket.sla = calculateSla(ticket);
+    ticket.breached = ticket.sla.breached;
+  }
+  return ticket;
 }
 
 export async function listComments(ticketId, includeInternal = false) {

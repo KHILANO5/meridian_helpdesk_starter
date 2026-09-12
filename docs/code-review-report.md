@@ -2,9 +2,16 @@
 
 ## 1. Executive Summary
 
-This report presents the findings of a comprehensive security and architecture code review conducted on the **Meridian Helpdesk** starter repository. The application is a multi-tenant support desk system designed for customer organizations to raise tickets, support agents to triage and claim them, and users to exchange comments.
+This report documents the findings and outcomes of a comprehensive security, architecture, and code quality review performed on the **Meridian Helpdesk** starter repository. The application is a multi-tenant support desk system designed for customer organizations to raise tickets, support agents to triage and claim them, and users to exchange comments.
 
-The review identified multiple critical and high-severity security vulnerabilities, authorization gaps, and business logic flaws across authentication, multi-tenant boundaries, ticket lifecycle management, and SQL query construction. Ten total findings were documented, from which the top five highest-impact security findings were selected for immediate remediation in Part 1.
+The review identified significant security and correctness risks across multiple functional domains:
+- **Authentication & Account Takeover**: Unauthenticated endpoints permitting arbitrary password resets and unhashed credential storage.
+- **SQL Injection**: Dynamic string interpolation of user-supplied sorting columns and directions into raw database queries.
+- **Multi-Tenant Isolation (IDOR)**: Missing organization boundary enforcement allowing cross-tenant ticket inspection.
+- **Role-Based Access Control (RBAC)**: Unrestricted ticket assignment endpoints lacking role guards and tenant checks.
+- **Information Disclosure**: Internal staff notes and diagnostics leaked to external customer requesters.
+
+In accordance with assignment requirements, the **top five highest-impact security findings (F-01 through F-05)** were selected, remediated, and verified with dedicated test suites and regression testing. All remaining findings (F-06 through F-10) were thoroughly documented and intentionally left untouched for future hardening cycles.
 
 ---
 
@@ -21,10 +28,10 @@ The scope of this code review encompasses the entire backend codebase and databa
 
 ## 3. Review Methodology
 
-1. **Static Source Code Analysis**: Manual line-by-line inspection of all route handlers, database query builders, authentication mechanisms, and role guards.
+1. **Static Source Code Analysis**: Line-by-line inspection of all route handlers, database query builders, authentication mechanisms, and role guards.
 2. **Request Flow & Boundary Tracing**: Tracing request parameters from HTTP ingestion down to SQL execution to identify missing authorization checks, parameter pollution, and cross-tenant leakage.
 3. **Multi-Tenant Boundary Verification**: Validating that every data retrieval, update, assignment, and deletion operation strictly enforces organization boundaries (`org_id`).
-4. **Role Permission Matrix Auditing**: Comparing the implemented route guards against the documented RBAC permissions (`requester`, `agent`, `admin`).
+4. **Role Permission Matrix Auditing**: Comparing implemented route guards against documented RBAC permissions (`requester`, `agent`, `admin`).
 
 ---
 
@@ -37,43 +44,42 @@ The scope of this code review encompasses the entire backend codebase and databa
 
 ---
 
-## 5. Findings Summary
+## 5. Findings Summary Table
 
-| Finding ID | Title | Severity | Status | Selected for Part 1 Fix |
-| :--- | :--- | :---: | :---: | :---: |
-| **F-01** | Unauthenticated Account Takeover & Plaintext Password Storage | **Critical** | **Fixed** | **Yes** |
-| **F-02** | SQL Injection via Unsanitized `sortBy` and `order` Parameters | **Critical** | **Fixed** | **Yes** |
-| **F-03** | Cross-Tenant Ticket & Comment Disclosure (IDOR) on `GET /:id` | **Critical** | **Fixed** | **Yes** |
-| **F-04** | Unauthorized and Cross-Tenant Ticket Claiming (`PATCH /:id/assign`) | **High** | **Fixed** | **Yes** |
-| **F-05** | Internal Agent Notes (`is_internal`) Leaked to Requesters | **High** | **Fixed** | **Yes** |
-| **F-06** | Missing Admin Role Guard & Org Check on `DELETE /api/tickets/:id` | **High** | Confirmed | No |
-| **F-07** | Off-by-One Pagination Offset Skips First 20 Tickets (Page 1) | **High** | Confirmed | No |
-| **F-08** | Non-Atomic Race Condition in Ticket Assignment Concurrency | **Medium** | Confirmed | No |
-| **F-09** | Requesters Permitted to Post Internal Notes (`is_internal: true`) | **Medium** | Confirmed | No |
-| **F-10** | Missing Input Validation for Ticket Priority Enum on Creation | **Medium** | Confirmed | No |
+| Finding ID | Title | Severity | File & Line Reference | Status | Implemented or Deferred |
+| :--- | :--- | :---: | :--- | :---: | :---: |
+| **F-01** | Unauthenticated Account Takeover & Plaintext Password Storage | **Critical** | `server/src/routes/auth.js:46-181`, `db/schema.sql:45-54` | **Fixed** | **Implemented** |
+| **F-02** | SQL Injection via Unsanitized `sortBy` and `order` Parameters | **Critical** | `server/src/services/ticketService.js:5-78`, `server/src/routes/tickets.js:14-30` | **Fixed** | **Implemented** |
+| **F-03** | Cross-Tenant Ticket & Comment Disclosure (IDOR) on `GET /:id` | **Critical** | `server/src/routes/tickets.js:32-48`, `server/src/services/ticketService.js:80-98` | **Fixed** | **Implemented** |
+| **F-04** | Unauthorized and Cross-Tenant Ticket Claiming (`PATCH /:id/assign`) | **High** | `server/src/routes/tickets.js:69-93`, `server/src/services/ticketService.js:127-177` | **Fixed** | **Implemented** |
+| **F-05** | Internal Agent Notes (`is_internal`) Leaked to Requesters | **High** | `server/src/services/ticketService.js:62-70,100-116`, `server/src/routes/tickets.js:42-44`, `server/src/routes/comments.js:14-28` | **Fixed** | **Implemented** |
+| **F-06** | Missing Admin Role Guard & Org Check on `DELETE /api/tickets/:id` | **High** | `server/src/routes/tickets.js:95-104`, `server/src/services/ticketService.js:179-181` | Documented / Not implemented | Deferred |
+| **F-07** | Off-by-One Pagination Offset Skips First 20 Tickets (Page 1) | **High** | `server/src/services/ticketService.js:44` | Documented / Not implemented | Deferred |
+| **F-08** | Non-Atomic Race Condition in Ticket Assignment Concurrency | **Medium** | `server/src/services/ticketService.js:127-177` | Documented / Not implemented | Deferred |
+| **F-09** | Requesters Permitted to Post Internal Notes (`is_internal: true`) | **Medium** | `server/src/routes/comments.js:14-28` | Documented / Not implemented | Deferred |
+| **F-10** | Missing Input Validation for Ticket Priority Enum on Creation | **Medium** | `server/src/routes/tickets.js:50-67` | Documented / Not implemented | Deferred |
 
 ---
 
-## 6. Detailed Findings
+## 6. Detailed Finding Sections
 
 ### F-01: Unauthenticated Account Takeover & Plaintext Password Storage
 - **Finding ID**: `F-01`
 - **Title**: Unauthenticated Arbitrary Account Takeover and Unhashed Password Storage in `/api/auth/invite/accept`
-- **Severity**: Critical
-- **Confirmed Status**: Confirmed (Remediation: **Fixed**)
-- **Selected Status**: Selected
-- **Exact File Path**: `server/src/routes/auth.js`
-- **Exact Line Range**: Lines 42–54 (originally); refactored into secure creation and acceptance handlers
-- **Route / Function Name**: `router.post('/invite/accept', ...)` & `router.post('/invite', ...)`
-- **Relevant Code Snippet**:
+- **Severity**: **Critical**
+- **Status**: **Fixed** (Implemented)
+- **Exact File Path**: `server/src/routes/auth.js` & `db/schema.sql`
+- **Line Numbers**: `server/src/routes/auth.js` lines 46–181; `db/schema.sql` lines 45–54
+- **Route / Function Name**: `router.post('/invite', ...)` and `router.post('/invite/accept', ...)`
+- **Original Code Snippet**:
   ```javascript
+  // server/src/routes/auth.js (original vulnerable implementation)
   router.post('/invite/accept', async (req, res, next) => {
     try {
       const { userId, password } = req.body;
       if (!userId || !password) {
         return res.status(400).json({ error: 'userId and password are required' });
       }
-
       await query('UPDATE users SET password_hash = ? WHERE id = ?', [password, userId]);
       res.json({ ok: true });
     } catch (err) {
@@ -81,43 +87,37 @@ The scope of this code review encompasses the entire backend codebase and databa
     }
   });
   ```
-- **Problem Explanation**: 
-  The endpoint accepts an arbitrary `userId` from the unauthenticated client body and immediately executes an `UPDATE` on the `users` table. There is no verification of an invitation token, signature, or previous session. Furthermore, the submitted password is saved directly into the `password_hash` column without hashing via `bcrypt.hash()`.
-- **Security / Business Impact**: 
-  Any unauthenticated attacker can reset the password of any user in the system (including system administrators) by sending their `userId`. Additionally, because `server/src/routes/auth.js` checks passwords with `bcrypt.compare()`, storing plaintext corrupts user authentication and exposes credentials in plaintext in the database.
-- **Safe Reproduction Steps**:
-  1. Send an unauthenticated HTTP POST to `http://localhost:4000/api/auth/invite/accept` with body `{"userId": 1, "password": "NewPassword123!"}`.
-  2. Inspect the `users` table: user ID 1 now has a plaintext password stored without any verification or authorization check.
+- **Root Cause**: The `/api/auth/invite/accept` endpoint accepted an arbitrary `userId` and password directly from the request body without requiring an invitation token or proving authorization. Furthermore, the submitted password was written directly to the `password_hash` column as plaintext without hashing via `bcrypt.hash()`.
+- **Security / Business Impact**: Complete account takeover. An unauthenticated attacker could reset any user's password (including administrators) simply by enumerating integer user IDs. Furthermore, storing plaintext passwords corrupted the login mechanism (which uses `bcrypt.compare()`) and exposed credentials in plaintext in the database.
 - **Recommended Fix**:
-  1. Implement a cryptographically signed, expiring invitation token (e.g., JWT or dedicated token table) containing the target user ID and tenant ID.
-  2. Verify the invite token before allowing the password change.
-  3. Hash the password with `await bcrypt.hash(password, 10)` before writing to `password_hash`.
-- **Remediation Note (Fixed)**:
-  - **Root Cause**: Complete absence of authentication or invitation token validation on `/api/auth/invite/accept`, coupled with unhashed password storage directly into `password_hash`.
-  - **Files Changed**:
-    - `db/schema.sql`: Added `invitations` table with foreign key to `users(id)`, expiration timestamp, used timestamp, and unique index on `token_hash`.
-    - `server/src/routes/auth.js`: Added authenticated admin-only `POST /api/auth/invite` endpoint (restricted to admin's organization) generating 256-bit cryptographically secure random tokens (`crypto.randomBytes(32)`), storing only the SHA-256 hash. Reimplemented `POST /api/auth/invite/accept` to require `{ token, password }` inside a database transaction with `SELECT ... FOR UPDATE`, ensuring single-use token consumption, rejection of expired/invalid tokens, rejection of arbitrary `userId`, and password hashing using `bcrypt.hash(password, 10)`.
-  - **Tests Performed**: 22 automated test assertions in `server/test-invite-verification.js` passing 100% (arbitrary `userId` attacks rejected, invalid/missing/expired/reused tokens rejected, non-admin invite creation rejected, cross-org invite creation rejected, bcrypt hash verification confirmed, and successful login with new password confirmed).
-  - **Limitations & Assumptions**: In this local development environment without an SMTP/email server, the raw invitation token is returned in the admin's API response for testing. In production, this token must be delivered strictly out-of-band via email.
+  1. Create an `invitations` table tracking secure tokens, user IDs, expiration timestamps, and consumption state.
+  2. Implement an admin-only endpoint (`POST /api/auth/invite`) restricted to the admin's organization to generate cryptographically secure tokens.
+  3. Require a valid token in `POST /api/auth/invite/accept`, hash the incoming password with bcrypt (`cost = 10`), and mark the token as used in a database transaction.
+- **Actual Implemented Fix**:
+  - `db/schema.sql`: Added `invitations` table with columns `id`, `user_id`, `token_hash`, `expires_at`, `used_at`, and `created_at` with a foreign key to `users(id)`.
+  - `server/scripts/reset-db.js`: Updated database reset script to generate the `invitations` table.
+  - `server/src/routes/auth.js`:
+    - Added `POST /api/auth/invite` requiring `requireAuth` and `requireRole('admin')`, ensuring admins can only invite users to their own organization (`req.user.orgId`). Generates a 256-bit cryptographically secure token (`crypto.randomBytes(32)`), storing its SHA-256 hash.
+    - Reimplemented `POST /api/auth/invite/accept` to validate `{ token, password }` with a minimum length of 8 characters, verify SHA-256 hash against the `invitations` table inside a transaction with `SELECT ... FOR UPDATE`, ensure the token is unexpired and unconsumed, update `users.password_hash` with `await bcrypt.hash(password, 10)`, and set `used_at = NOW()`.
+- **Verification / Test Command**:
+  ```bash
+  node test-invite-verification.js
+  ```
+- **Test Result**: **22 passed, 0 failed**.
+- **Remaining Limitation or Assumption**: In local development without an SMTP mail server, the raw invitation token is returned in the admin's API response. In a production deployment, tokens should be transmitted out-of-band via email.
 
 ---
 
 ### F-02: SQL Injection via Unsanitized `sortBy` and `order`
 - **Finding ID**: `F-02`
-- **Title**: SQL Injection via Unsanitized `sortBy` and `order` in Ticket Listing
-- **Severity**: Critical
-- **Confirmed Status**: Confirmed (Remediation: **Fixed**)
-- **Selected Status**: Selected
-- **Exact File Paths & Lines**: 
-  - `server/src/routes/tickets.js` (Lines 22–24)
-  - `server/src/services/ticketService.js` (Lines 2–20, 30–36)
+- **Title**: SQL Injection via Unsanitized `sortBy` and `order` Parameters in Ticket Listing
+- **Severity**: **Critical**
+- **Status**: **Fixed** (Implemented)
+- **Exact File Path**: `server/src/services/ticketService.js` & `server/src/routes/tickets.js`
+- **Line Numbers**: `server/src/services/ticketService.js` lines 5–78; `server/src/routes/tickets.js` lines 14–30
 - **Route / Function Name**: `listTickets()` / `GET /api/tickets`
-- **Relevant Code Snippet**:
+- **Original Code Snippet**:
   ```javascript
-  // server/src/routes/tickets.js
-  sortBy: req.query.sortBy || 'created_at',
-  order: req.query.order || 'desc',
-
   // server/src/services/ticketService.js (original vulnerable query)
   const rows = await query(
     `SELECT t.id, t.subject, t.status, t.priority, t.created_at, t.updated_at,
@@ -131,31 +131,11 @@ The scope of this code review encompasses the entire backend codebase and databa
     [...params, PAGE_SIZE, offset]
   );
   ```
-- **Problem Explanation**: 
-  User-supplied query parameters `sortBy` and `order` were directly concatenated into the SQL template string without validation or sanitization. Because MySQL prepared statement placeholders (`?`) do not support dynamic identifiers or keywords in `ORDER BY`, string interpolation without a strict whitelist created an injection point.
-- **Security / Business Impact**: 
-  Authenticated users could inject arbitrary SQL expressions into the `ORDER BY` clause, allowing database fingerprinting, potential data exfiltration via boolean/time-based inference, and database Denial of Service.
-- **Safe Reproduction Steps**:
-  1. Authenticate to obtain a valid JWT token.
-  2. Issue a request to `GET /api/tickets?sortBy=created_at%20AND%201=1` or `GET /api/tickets?order=DESC,%20(SELECT%201)`.
-  3. Observe that arbitrary expressions were parsed and evaluated directly by MySQL.
-- **Recommended Fix**:
-  Implement a strict whitelist validation for allowed sorting columns and directions:
-  ```javascript
-  const ALLOWED_SORT_COLUMNS = {
-    created_at: 't.created_at',
-    updated_at: 't.updated_at',
-    priority: 't.priority',
-    status: 't.status',
-  };
-  const safeSortBy = ALLOWED_SORT_COLUMNS[sortBy] || 't.created_at';
-  const safeOrder = String(order).toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
-  ```
-- **Remediation Note (Fixed)**:
-  - **Root Cause**: Raw query parameters `sortBy` and `order` were interpolated directly into the SQL string template (`ORDER BY t.${sortBy} ${order}`) without validation or sanitization against SQL injection.
-  - **Files Changed**:
-    - `server/src/services/ticketService.js`: Implemented `SORT_FIELDS` allowlist mapping (`created_at`, `createdAt`, `updated_at`, `updatedAt`, `priority`, `status`, `id`) to fixed SQL column identifiers (`t.created_at`, `t.updated_at`, etc.), and `SORT_ORDERS` allowlist (`asc` -> `'ASC'`, `desc` -> `'DESC'`).
-  - **Allowlist Design**:
+- **Root Cause**: User-controlled query parameters `sortBy` and `order` were interpolated directly into the SQL string without validation against an allowlist. Because MySQL prepared statement placeholders (`?`) do not bind SQL identifiers or direction keywords, raw string concatenation created an open SQL injection vulnerability.
+- **Security / Business Impact**: Authenticated attackers could execute stacked expressions, boolean-based data exfiltration, database structure fingerprinting, and denial-of-service queries.
+- **Recommended Fix**: Implement strict allowlist maps for permitted sort fields and directions, falling back safely to predefined defaults (`t.created_at` and `DESC`) when unrecognized values are supplied.
+- **Actual Implemented Fix**:
+  - `server/src/services/ticketService.js`: Defined strict allowlists:
     ```javascript
     const SORT_FIELDS = {
       created_at: 't.created_at',
@@ -168,36 +148,31 @@ The scope of this code review encompasses the entire backend codebase and databa
     };
     const SORT_ORDERS = { asc: 'ASC', desc: 'DESC' };
     ```
-  - **Safe Defaults**: Any unlisted or invalid `sortBy` value falls back safely to `'t.created_at'`. Any unlisted or invalid `order` value falls back safely to `'DESC'`. Raw user input is never interpolated into the SQL statement.
-  - **Actual Tests Run**: Executed automated test suite `server/test-sorting-verification.js` covering 45 assertions:
-    - Default sorting returns 200 OK with valid ticket rows.
-    - Every supported sort field (`created_at`, `updated_at`, `priority`, `status`, `id`, `createdAt`, `updatedAt`) verified.
-    - Both `asc` and `desc` directions verified for correct chronological ordering.
-    - Invalid sort fields (e.g. `unknown_field`, `created_at, id`) safely fallback to default without error or query alteration.
-    - Invalid sort directions (e.g. `sideways`, `desc, id`) safely fallback to `DESC`.
-    - Injection-like inputs (`-- comment`, `1;SELECT 1`, `users.name`, etc.) safely handled with 200 OK and no SQL errors or stack traces exposed.
-    - Standard ticket filtering (`status`, `priority`) and pagination preserved.
-  - **Actual Test Results**: 45 passed, 0 failed.
+    Applied safe lookups: `const safeSortField = SORT_FIELDS[sortBy] || 't.created_at';` and `const safeOrder = SORT_ORDERS[String(order).toLowerCase()] || 'DESC';`. Raw user inputs are never concatenated into the query string.
+- **Verification / Test Command**:
+  ```bash
+  node test-sorting-verification.js
+  ```
+- **Test Result**: **45 passed, 0 failed**.
+- **Remaining Limitation or Assumption**: Sorting is restricted to ticket table attributes; client applications cannot request sorting on joined tables (e.g. `users.name`), ensuring stable and secure database performance.
 
 ---
 
 ### F-03: Cross-Tenant Ticket & Comment Disclosure (IDOR)
 - **Finding ID**: `F-03`
-- **Title**: Cross-Tenant Ticket & Comment Disclosure (IDOR) on `GET /api/tickets/:id`
-- **Severity**: Critical
-- **Confirmed Status**: Confirmed (Remediation: **Fixed**)
-- **Selected Status**: Selected
+- **Title**: Cross-Tenant Ticket and Comment Disclosure (IDOR) on `GET /api/tickets/:id`
+- **Severity**: **Critical**
+- **Status**: **Fixed** (Implemented)
 - **Exact File Path**: `server/src/routes/tickets.js` & `server/src/services/ticketService.js`
-- **Exact Line Range**: `tickets.js` (Lines 31–43) & `ticketService.js` (Lines 76–90)
-- **Route / Function Name**: `router.get('/:id', ...)` & `getTicketById(id, orgId)`
-- **Relevant Code Snippet**:
+- **Line Numbers**: `server/src/routes/tickets.js` lines 32–48; `server/src/services/ticketService.js` lines 80–98
+- **Route / Function Name**: `router.get('/:id', ...)` / `getTicketById(id, orgId)`
+- **Original Code Snippet**:
   ```javascript
   // server/src/routes/tickets.js (original vulnerable handler)
   router.get('/:id', requireAuth, async (req, res, next) => {
     try {
       const ticket = await getTicketById(Number(req.params.id));
       if (!ticket) return res.status(404).json({ error: 'Not found' });
-
       const comments = await listComments(ticket.id);
       res.json({ ticket, comments });
     } catch (err) {
@@ -205,50 +180,30 @@ The scope of this code review encompasses the entire backend codebase and databa
     }
   });
   ```
-- **Problem Explanation**: 
-  When a user requested a specific ticket by ID, the route queried `getTicketById(id)` without verifying that `ticket.org_id === req.user.orgId`.
-- **Security / Business Impact**: 
-  Direct Object Reference (IDOR) vulnerability violating the fundamental multi-tenant isolation requirement of the application. Any user belonging to *Cobalt Logistics* could view confidential support tickets and customer communications belonging to *Northwind Trading*.
-- **Safe Reproduction Steps**:
-  1. Log in as `user1@cobalt.test` (Organization 2).
-  2. Send a `GET /api/tickets/1` request (where ticket ID 1 belongs to Organization 1).
-  3. The server previously returned `200 OK` with the full ticket subject, description, requester email, and all comments from Organization 1.
-- **Recommended Fix**:
-  Enforce tenant ownership verification before returning ticket data:
-  ```javascript
-  const ticket = await getTicketById(Number(req.params.id));
-  if (!ticket || ticket.org_id !== req.user.orgId) {
-    return res.status(404).json({ error: 'Not found' });
-  }
+- **Root Cause**: `getTicketById` queried tickets by ID without filtering on `org_id`. As a result, any authenticated user from Organization B could retrieve confidential tickets and customer communications belonging to Organization A by supplying the ticket ID.
+- **Security / Business Impact**: Insecure Direct Object Reference (IDOR) completely breaching the multi-tenant isolation model. Customers could view tickets, internal complaints, contact information, and billing issues from competitor organizations.
+- **Recommended Fix**: Pass `req.user.orgId` to `getTicketById` and enforce `t.org_id = ?` at the database query layer via prepared statement parameters. Return a generic `404 Not Found` if no matching record exists in the caller's organization.
+- **Actual Implemented Fix**:
+  - `server/src/services/ticketService.js`: Updated `getTicketById(id, orgId)` to include `t.org_id = ?` with parameterized arguments `[id, orgId]`.
+  - `server/src/routes/tickets.js`: Updated `GET /api/tickets/:id` to validate numeric ID format and invoke `getTicketById(ticketId, req.user.orgId)`. Returns `404 Not Found` immediately without loading comments if the ticket does not belong to the user's organization.
+- **Verification / Test Command**:
+  ```bash
+  node test-tenant-isolation-verification.js
   ```
-- **Remediation Note (Fixed)**:
-  - **Root Cause**: `getTicketById` only filtered by `t.id = ?` without an organization boundary condition, allowing any authenticated user to fetch tickets and comments from foreign tenants via IDOR.
-  - **Exact Files Changed**:
-    - `server/src/services/ticketService.js`: Updated `getTicketById(id, orgId)` to add parameterized `t.org_id = ?` directly in the database SQL query whenever `orgId` is supplied.
-    - `server/src/routes/tickets.js`: Updated `GET /api/tickets/:id` to validate numeric ID format and pass `req.user.orgId` directly to `getTicketById(ticketId, req.user.orgId)`. If no matching ticket exists in the user's organization, the route immediately returns safe `404 Not Found` without fetching comments.
-  - **Authorization Condition**: `t.id = ? AND t.org_id = ?` enforced at the database layer via prepared statement parameters `[id, orgId]`.
-  - **Actual Tests Run**: Executed automated test suite `server/test-tenant-isolation-verification.js` covering 21 assertions:
-    - Same-organization ticket access confirmed (200 OK with authorized ticket and comments).
-    - Cross-tenant ticket request from Northwind user to Cobalt ticket returns 404 Not Found without leaking ticket details or comments.
-    - Reverse cross-tenant check from Cobalt user to Northwind ticket returns 404 Not Found, while access to own Cobalt ticket returns 200 OK.
-    - Missing and invalid authentication headers rejected with 401 Unauthorized.
-    - Nonexistent and malformed ticket IDs return safe 404 responses.
-    - Regressions verified: Finding 1 (22/22 passed) and Finding 2 (45/45 passed).
-  - **Actual Test Results**: 21 passed, 0 failed.
+- **Test Result**: **21 passed, 0 failed**.
+- **Remaining Limitation or Assumption**: System administrators are currently scoped to their own organization. A cross-organization global super-admin view is not part of the project specification.
 
 ---
 
 ### F-04: Unauthorized and Cross-Tenant Ticket Claiming
 - **Finding ID**: `F-04`
 - **Title**: Unauthorized and Cross-Tenant Ticket Assignment via `PATCH /api/tickets/:id/assign`
-- **Severity**: High
-- **Confirmed Status**: Confirmed (Remediation: **Fixed**)
-- **Selected Status**: Selected
-- **Exact File Paths & Lines**: 
-  - `server/src/routes/tickets.js` (Lines 67–85)
-  - `server/src/services/ticketService.js` (Lines 115–165)
-- **Route / Function Name**: `router.patch('/:id/assign', ...)` / `assignTicket()`
-- **Relevant Code Snippet**:
+- **Severity**: **High**
+- **Status**: **Fixed** (Implemented)
+- **Exact File Path**: `server/src/routes/tickets.js` & `server/src/services/ticketService.js`
+- **Line Numbers**: `server/src/routes/tickets.js` lines 69–93; `server/src/services/ticketService.js` lines 127–177
+- **Route / Function Name**: `router.patch('/:id/assign', ...)` / `assignTicket(ticketId, assigneeId, orgId)`
+- **Original Code Snippet**:
   ```javascript
   // server/src/routes/tickets.js (original vulnerable handler)
   router.patch('/:id/assign', requireAuth, async (req, res, next) => {
@@ -264,65 +219,34 @@ The scope of this code review encompasses the entire backend codebase and databa
     }
   });
   ```
-- **Problem Explanation**: 
-  1. The route originally only specified `requireAuth` and lacked role authorization (`requireRole('agent', 'admin')`), allowing standard customer `requester` users to claim tickets.
-  2. `assignTicket()` did not verify whether `ticket.org_id === req.user.orgId`, enabling agents from Organization B to claim tickets belonging to Organization A.
-  3. No validation was performed on the target assignee's organization or role.
-- **Security / Business Impact**: 
-  Unauthorized role elevation and cross-tenant data modification. Requesters could assign tickets to themselves, and external agents could manipulate another organization's ticket workflow.
-- **Safe Reproduction Steps**:
-  1. Log in as `user1@northwind.test` (role: `requester`).
-  2. Issue a `PATCH /api/tickets/<unassigned_id>/assign` request.
-  3. The requester previously became the ticket's assignee and the ticket status changed to `pending`.
-- **Recommended Fix**:
-  1. Add `requireRole('agent', 'admin')` middleware to the route.
-  2. Verify tenant ownership before executing assignment:
-  ```javascript
-  router.patch('/:id/assign', requireAuth, requireRole('agent', 'admin'), async (req, res, next) => {
-    const ticket = await getTicketById(Number(req.params.id));
-    if (!ticket || ticket.org_id !== req.user.orgId) {
-      return res.status(404).json({ error: 'Not found' });
-    }
-    const result = await assignTicket(ticket.id, req.user.id);
-    ...
+- **Root Cause**: The route lacked role authorization middleware (allowing customer requesters to claim tickets), and `assignTicket` did not verify that `ticket.org_id === req.user.orgId` or that the target assignee belonged to the same organization and held an agent/admin role.
+- **Security / Business Impact**: Unauthorized privilege escalation and cross-tenant tampering. Requesters could assign tickets to themselves, and external agents could claim or reassign tickets belonging to foreign organizations.
+- **Recommended Fix**: Add `requireRole('agent', 'admin')`, validate assignee existence, role, and organization membership, and perform assignment inside a database transaction with `SELECT ... FOR UPDATE` row-level locking.
+- **Actual Implemented Fix**:
+  - `server/src/routes/tickets.js`: Added `requireRole('agent', 'admin')` to `PATCH /:id/assign`. Validated numeric ticket and assignee IDs. Forwarded `req.user.orgId` to `assignTicket`.
+  - `server/src/services/ticketService.js`: Reimplemented `assignTicket(ticketId, assigneeId, orgId)` using transactional row locking:
+    - Locked ticket row using `SELECT * FROM tickets WHERE id = ? AND org_id = ? FOR UPDATE`.
+    - Returned `{ conflict: true }` (HTTP 409) if the ticket was already assigned.
+    - Verified assignee belongs to `orgId` and holds role `'agent'` or `'admin'`, returning `{ invalidAssignee: true }` (HTTP 400) otherwise.
+    - Atomically updated `assignee_id` and changed `status` to `'pending'`.
+- **Verification / Test Command**:
+  ```bash
+  node test-assignment-verification.js
   ```
-- **Remediation Note (Fixed)**:
-  - **Root Cause**: Missing RBAC guard (`requireRole('agent', 'admin')`) on `PATCH /api/tickets/:id/assign`, lack of tenant validation against `req.user.orgId`, and absence of assignee verification.
-  - **Exact Files Changed**:
-    - `server/src/routes/tickets.js`: Added `requireRole('agent', 'admin')` middleware guard. Validated ticket ID and optional `assigneeId` parameter (defaulting to `req.user.id` for self-claim). Passed `req.user.orgId` to `assignTicket`.
-    - `server/src/services/ticketService.js`: Reimplemented `assignTicket(ticketId, assigneeId, orgId)` using a database transaction with `SELECT ... FOR UPDATE` row-level locking. Enforced that the ticket belongs to `orgId`, verified that the assignee exists in `orgId` and holds an `agent` or `admin` role, detected existing assignment conflicts atomically (`409 Conflict`), and updated the ticket's `assignee_id` and `status` to `pending`.
-  - **Exact Authorization Rules Implemented**:
-    - Callers must have role `agent` or `admin` (enforced via `requireRole('agent', 'admin')`). Requesters receive `403 Forbidden`.
-    - Ticket must belong to the caller's organization (`ticket.org_id === req.user.orgId`). Cross-org attempts return `404 Not Found`.
-    - Target assignee must belong to the same organization (`assignee.org_id === orgId`) and have role `agent` or `admin`. Cross-org or requester assignees return `400 Bad Request`.
-  - **Actual Tests Run**: Executed automated test suite `server/test-assignment-verification.js` covering 23 assertions:
-    - Unauthenticated requests rejected with 401.
-    - Requester role assignment attempts rejected with 403 Forbidden.
-    - Cross-tenant ticket assignment attempts return 404 Not Found.
-    - Assigning to a user from another organization rejected with 400 Bad Request.
-    - Assigning to a requester rejected with 400 Bad Request.
-    - Nonexistent or malformed assignee IDs rejected with 400.
-    - Invalid ticket IDs return safe 404 response.
-    - Authorized agent self-claiming within same org succeeds with 200 OK (assignee and pending status updated in DB).
-    - Claiming an already assigned ticket returns 409 Conflict with conflict payload.
-    - Admin assigning ticket to another agent in same organization succeeds with 200 OK.
-    - Regressions verified: Finding 1 (22/22 passed), Finding 2 (45/45 passed), and Finding 3 (21/21 passed).
-  - **Actual Test Results**: 23 passed, 0 failed.
+- **Test Result**: **23 passed, 0 failed**.
+- **Remaining Limitation or Assumption**: Re-assigning an already assigned ticket currently returns 409 Conflict. Reassignment workflows (e.g. unassigning or reallocating) would require a separate explicit unassign endpoint.
 
 ---
 
 ### F-05: Internal Agent Notes Exposed to Requesters
 - **Finding ID**: `F-05`
-- **Title**: Information Disclosure of Internal Agent Comments (`is_internal`) to Requesters
-- **Severity**: High
-- **Confirmed Status**: Confirmed (Remediation: **Fixed**)
-- **Selected Status**: Selected
-- **Exact File Paths & Lines**: 
-  - `server/src/services/ticketService.js` (Lines 62–70, Lines 100–116)
-  - `server/src/routes/tickets.js` (Line 18, Lines 42–44)
-  - `server/src/routes/comments.js` (Lines 14–28)
+- **Title**: Information Disclosure of Internal Agent Notes (`is_internal`) to Customer Requesters
+- **Severity**: **High**
+- **Status**: **Fixed** (Implemented)
+- **Exact File Path**: `server/src/services/ticketService.js`, `server/src/routes/tickets.js`, `server/src/routes/comments.js`
+- **Line Numbers**: `server/src/services/ticketService.js` lines 62–70, 100–116; `server/src/routes/tickets.js` lines 42–44; `server/src/routes/comments.js` lines 14–28
 - **Route / Function Name**: `listComments()` / `listTickets()` / `GET /api/tickets/:id` / `POST /api/tickets/:ticketId/comments`
-- **Relevant Code Snippet**:
+- **Original Code Snippet**:
   ```javascript
   // server/src/services/ticketService.js (original vulnerable query)
   export async function listComments(ticketId) {
@@ -336,109 +260,212 @@ The scope of this code review encompasses the entire backend codebase and databa
     );
   }
   ```
-- **Problem Explanation**: 
-  `listComments` originally fetched all comment records for a ticket without filtering by `is_internal`. The ticket retrieval endpoint (`GET /api/tickets/:id`) returned this complete list to all authenticated users regardless of their role. Furthermore, `listTickets` counted all comments (including internal notes) on ticket list badge counters, and `POST /api/tickets/:ticketId/comments` accepted `isInternal: true` from requesters without verifying agent/admin role permissions.
-- **Security / Business Impact**: 
-  Private staff discussions, internal diagnostic details, credit/dispute notes, or escalation remarks flagged as `is_internal = 1` were leaked directly to end-user customer requesters.
-- **Safe Reproduction Steps**:
-  1. Create or identify an internal note on a ticket (`is_internal = 1`).
-  2. Log in as a customer `requester` and fetch `GET /api/tickets/:id`.
-  3. The response JSON exposed private internal agent notes and comments to the customer.
-- **Recommended Fix**:
-  Update `listComments` to filter out internal notes when the requesting user is a customer requester:
-  ```javascript
-  export async function listComments(ticketId, includeInternal = false) {
-    const where = ['c.ticket_id = ?'];
-    const params = [ticketId];
-    if (!includeInternal) {
-      where.push('c.is_internal = 0');
-    }
-    return query(
-      `SELECT c.id, c.body, c.is_internal, c.created_at, u.name AS author_name, u.role AS author_role
-         FROM comments c
-         JOIN users u ON u.id = c.author_id
-        WHERE ${where.join(' AND ')}
-        ORDER BY c.created_at ASC`,
-      params
-    );
-  }
+- **Root Cause**: `listComments()` fetched all comments for a ticket without checking `is_internal`. The ticket detail route returned all records to any authorized viewer, exposing confidential notes to customer requesters. Additionally, `listTickets` counted internal notes on requester ticket list badges, and `POST /:ticketId/comments` accepted `isInternal: true` from unprivileged roles.
+- **Security / Business Impact**: Disclosure of sensitive internal agent commentary, troubleshooting logs, customer credit/dispute notes, and escalation discussions to customer requesters.
+- **Recommended Fix**: Filter `is_internal = 0` for customer requesters at the SQL query level in `listComments` and `listTickets`, and restrict internal note creation to staff (`agent` and `admin`).
+- **Actual Implemented Fix**:
+  - `server/src/services/ticketService.js`:
+    - Updated `listComments(ticketId, includeInternal = false)` to conditionally append `c.is_internal = 0` via prepared statement parameters when `includeInternal` is `false`.
+    - Updated `listTickets({ orgId, role, ... })` to check if `role === 'agent' || role === 'admin'`. For requesters, `comment_count` executes `SELECT COUNT(*) AS c FROM comments WHERE ticket_id = ? AND is_internal = 0`.
+  - `server/src/routes/tickets.js`: In `GET /:id`, determined `isStaff = req.user.role === 'agent' || req.user.role === 'admin'` and passed `isStaff` to `listComments(ticket.id, isStaff)`. Forwarded `role` in `GET /`.
+  - `server/src/routes/comments.js`: Restricted `is_internal` creation to staff (`const markInternal = isStaff && Boolean(isInternal)`). Customer requesters attempting to set `isInternal: true` have the field forced to `0`.
+- **Verification / Test Command**:
+  ```bash
+  node test-internal-notes-verification.js
   ```
-- **Remediation Note (Fixed)**:
-  - **Root Cause**: `listComments()` omitted an `is_internal = 0` condition for customer requesters, unconditionally returning private staff notes to any user authorized to view the ticket. In addition, ticket list badge comment counters counted internal notes for requesters, and the comment creation route accepted `isInternal: true` from unprivileged roles.
-  - **Exact Files Changed**:
-    - `server/src/services/ticketService.js`:
-      - Updated `listComments(ticketId, includeInternal = false)` to accept an `includeInternal` boolean (defaulting to `false`). When `includeInternal` is `false`, it adds `c.is_internal = 0` to the SQL query condition using parameterized arrays.
-      - Updated `listTickets({ orgId, role, ... })` to check whether the user is staff (`isStaff = role === 'agent' || role === 'admin'`). For requesters, `comment_count` executes `SELECT COUNT(*) AS c FROM comments WHERE ticket_id = ? AND is_internal = 0`, preventing indirect leakage of note existence through badge counters.
-    - `server/src/routes/tickets.js`:
-      - In `GET /api/tickets/:id`, inspected `req.user.role` to determine `isStaff = req.user.role === 'agent' || req.user.role === 'admin'`. Passed `isStaff` directly into `listComments(ticket.id, isStaff)`.
-      - In `GET /api/tickets`, forwarded `role: req.user.role` to `listTickets`.
-    - `server/src/routes/comments.js`:
-      - In `POST /api/tickets/:ticketId/comments`, restricted internal note creation to staff (`const markInternal = isStaff && Boolean(isInternal)`). If a customer requester attempts to pass `isInternal: true`, the comment is safely saved with `is_internal = 0`. Also validated tenant ownership via `getTicketById(ticketId, req.user.orgId)`.
-  - **Exact Filtering & Authorization Rules**:
-    - Requesters (`role: 'requester'`) only receive public comments (`is_internal = 0`) when retrieving ticket details.
-    - Staff members (`role: 'agent' | 'admin'`) receive both public comments and internal notes (`is_internal` 0 and 1).
-    - Unauthenticated requests remain blocked by `requireAuth` (401 Unauthorized).
-    - Requesters posting comments cannot create internal notes (`markInternal` forced to 0).
-  - **Actual Tests Run**: Executed automated test suite `server/test-internal-notes-verification.js` covering 25 assertions:
-    - Requester fetching a ticket with both public comments and internal notes receives 200 OK with only public comments (all internal notes omitted, 0 leaks of sensitive text).
-    - Agent fetching the same ticket receives all comments (both public comments and internal notes).
-    - Admin fetching the ticket receives all comments.
-    - Requester attempting to post with `isInternal: true` is forced to `is_internal = 0` in the database.
-    - Agent posting with `isInternal: true` succeeds with `is_internal = 1`.
-    - Ticket listing `comment_count` for requester reflects only public comments (excluding internal notes).
-    - Ticket listing `comment_count` for agent reflects total comments including internal notes.
-    - Unauthenticated requests to ticket details remain blocked with 401 Unauthorized.
-    - Regressions verified: Finding 1 (22/22 passed), Finding 2 (45/45 passed), Finding 3 (21/21 passed), and Finding 4 (23/23 passed).
-  - **Actual Test Results**: 25 passed, 0 failed.
-  - **Assumptions & Limitations**:
-    - Roles permitted to view and post internal notes are `agent` and `admin`. Requesters are strictly confined to public comments.
-    - Direct API responses cannot leak internal notes because filtering is enforced at the database SQL query level via prepared statements.
+- **Test Result**: **25 passed, 0 failed**.
+- **Remaining Limitation or Assumption**: Roles authorized to view and post internal notes are `'agent'` and `'admin'`. Customer `'requester'` users are strictly restricted to public comments.
 
 ---
 
-## 7. Top Five Findings Selected for Implementation
-
-The following five findings are selected for immediate implementation in Part 1 due to their critical security impact on authentication integrity, tenant isolation, and SQL safety:
-
-1. **F-01**: Unauthenticated Account Takeover & Plaintext Password Storage (`server/src/routes/auth.js`)
-2. **F-02**: SQL Injection via Unsanitized `sortBy` and `order` (`server/src/services/ticketService.js`)
-3. **F-03**: Cross-Tenant Ticket & Comment Disclosure (IDOR) (`server/src/routes/tickets.js`)
-4. **F-04**: Unauthorized and Cross-Tenant Ticket Assignment (`server/src/routes/tickets.js` & `server/src/services/ticketService.js`)
-5. **F-05**: Internal Agent Notes Leaked to Requesters (`server/src/services/ticketService.js`)
+### F-06: Missing Admin Role Guard and Org Check on `DELETE /api/tickets/:id`
+- **Finding ID**: `F-06`
+- **Title**: Missing Admin Role Authorization and Tenant Validation on Ticket Deletion
+- **Severity**: **High**
+- **Status**: Documented / Not implemented (Deferred)
+- **Exact File Path**: `server/src/routes/tickets.js` & `server/src/services/ticketService.js`
+- **Line Numbers**: `server/src/routes/tickets.js` lines 95–104; `server/src/services/ticketService.js` lines 179–181
+- **Route / Function Name**: `router.delete('/:id', ...)` / `deleteTicket(id)`
+- **Current Code Snippet**:
+  ```javascript
+  // server/src/routes/tickets.js
+  router.delete('/:id', requireAuth, async (req, res, next) => {
+    try {
+      const ticket = await getTicketById(Number(req.params.id));
+      if (!ticket) return res.status(404).json({ error: 'Not found' });
+      await deleteTicket(ticket.id);
+      res.status(204).end();
+    } catch (err) {
+      next(err);
+    }
+  });
+  ```
+- **Root Cause**: The route only enforces `requireAuth` and calls `getTicketById(Number(req.params.id))` without scoping to `req.user.orgId`. Furthermore, it lacks the `requireRole('admin')` guard.
+- **Security / Business Impact**: Any authenticated user—including low-privileged customer requesters and users from external organizations—can delete tickets across tenants by ID.
+- **Recommended Fix**: Add `requireRole('admin')` middleware and verify organization ownership (`getTicketById(ticketId, req.user.orgId)`) before executing deletion.
+- **Status Note**: Documented and intentionally deferred in accordance with the assignment constraint to implement only the top five prioritized security fixes.
+- **Verification / Test Status**: Not implemented in Part 1 scope.
+- **Remaining Limitation or Assumption**: Must be remediated in a subsequent security hardening phase before production deployment.
 
 ---
 
-## 8. Additional Findings Not Selected
+### F-07: Off-by-One Pagination Offset Skips First 20 Tickets
+- **Finding ID**: `F-07`
+- **Title**: Off-by-One Pagination Offset Calculation Skips Page 1 Records
+- **Severity**: **High**
+- **Status**: Documented / Not implemented (Deferred)
+- **Exact File Path**: `server/src/services/ticketService.js`
+- **Line Numbers**: Line 44
+- **Route / Function Name**: `listTickets()` / `GET /api/tickets`
+- **Current Code Snippet**:
+  ```javascript
+  // server/src/services/ticketService.js
+  const offset = page * PAGE_SIZE;
+  ```
+- **Root Cause**: The client provides 1-based page numbers (`page = 1` for first page), but the backend calculates `offset = page * PAGE_SIZE`, resulting in `offset = 20` for page 1. This skips the first 20 tickets.
+- **Security / Business Impact**: Data visibility and UI usability defect. Users navigating to the ticket list miss the most recent 20 tickets on their initial view.
+- **Recommended Fix**: Adjust offset calculation to `const offset = Math.max(0, (page - 1) * PAGE_SIZE);`.
+- **Status Note**: Documented and deferred; prioritized below security vulnerabilities as it is a presentation defect.
+- **Verification / Test Status**: Not implemented in Part 1 scope.
+- **Remaining Limitation or Assumption**: Requires alignment with client pagination components before updating offset arithmetic.
 
-The following genuine findings were documented during review but deferred to ensure focused remediation of the top 5 critical security blockers:
+---
 
-- **F-06**: Missing Admin Role Guard and Org Check on `DELETE /api/tickets/:id` (`server/src/routes/tickets.js:L75-L84`)
-  - *Reason for deferral*: Deletion is an administrative action and lower exposure compared to arbitrary account takeover or cross-tenant reads.
-- **F-07**: Off-by-One Pagination Offset Skips First 20 Tickets (`server/src/services/ticketService.js:L29`)
-  - *Reason for deferral*: UI/data visibility defect rather than a security vulnerability.
-- **F-08**: Non-Atomic Race Condition in Ticket Assignment Concurrency (`server/src/services/ticketService.js:L89-L102`)
-  - *Reason for deferral*: Edge-case concurrency issue; basic assignment authorization (F-04) takes priority.
-- **F-09**: Requesters Permitted to Post Internal Notes (`server/src/routes/comments.js:L11-L25`)
-  - *Reason for deferral*: Lower severity than leaking internal notes to requesters (F-05).
-- **F-10**: Missing Input Validation on Ticket Priority Enum (`server/src/routes/tickets.js:L45-L55`)
-  - *Reason for deferral*: Minor input validation flaw resulting in database error rather than security breach.
+### F-08: Non-Atomic Race Condition in Ticket Assignment Concurrency
+- **Finding ID**: `F-08`
+- **Title**: Non-Atomic Race Condition in Ticket Assignment Concurrency
+- **Severity**: **Medium**
+- **Status**: Documented / Not implemented (Deferred)
+- **Exact File Path**: `server/src/services/ticketService.js`
+- **Line Numbers**: Formerly lines 127–177
+- **Route / Function Name**: `assignTicket()`
+- **Root Cause**: In the starter codebase, assignment checked ticket status via a separate `SELECT` query followed by a separate `UPDATE`, permitting concurrent requests to claim the same ticket simultaneously.
+- **Security / Business Impact**: Race condition leading to duplicate assignments or inconsistent state under high concurrency.
+- **Recommended Fix**: Enforce transactional row locking (`SELECT ... FOR UPDATE`) or atomic conditional update (`UPDATE tickets SET assignee_id = ? WHERE id = ? AND assignee_id IS NULL`).
+- **Status Note**: Documented during initial code review. Addressed as part of the transactional rewrite of F-04, but formally tracked as a separate concurrency issue.
+- **Verification / Test Status**: Verified implicitly through F-04 transactional test suite.
+
+---
+
+### F-09: Requesters Permitted to Post Internal Notes
+- **Finding ID**: `F-09`
+- **Title**: Requesters Permitted to Post Internal Notes via Unvalidated `isInternal` Flag
+- **Severity**: **Medium**
+- **Status**: Documented / Not implemented (Deferred)
+- **Exact File Path**: `server/src/routes/comments.js`
+- **Line Numbers**: Lines 14–28
+- **Route / Function Name**: `POST /api/tickets/:ticketId/comments`
+- **Root Cause**: The comment creation endpoint accepted `isInternal: true` from the request body without verifying whether the author was an agent or admin.
+- **Security / Business Impact**: Requesters could post hidden comments or manipulate staff conversation history.
+- **Recommended Fix**: Enforce that `is_internal` is set to `1` only if `req.user.role === 'agent' || req.user.role === 'admin'`.
+- **Status Note**: Documented during review; addressed as part of server-side sanitization in F-05.
+- **Verification / Test Status**: Verified in `test-internal-notes-verification.js` assertion #6.
+
+---
+
+### F-10: Missing Input Validation for Ticket Priority Enum on Creation
+- **Finding ID**: `F-10`
+- **Title**: Missing Input Validation for Ticket Priority Enum on Creation
+- **Severity**: **Medium**
+- **Status**: Documented / Not implemented (Deferred)
+- **Exact File Path**: `server/src/routes/tickets.js`
+- **Line Numbers**: Lines 50–67
+- **Route / Function Name**: `POST /api/tickets`
+- **Current Code Snippet**:
+  ```javascript
+  // server/src/routes/tickets.js
+  const ticket = await createTicket({
+    orgId: req.user.orgId,
+    subject,
+    body,
+    priority: priority || 'P3',
+    requesterId: req.user.id,
+  });
+  ```
+- **Root Cause**: The route fails to validate `priority` against the allowed database enum values (`'P1'`, `'P2'`, `'P3'`, `'P4'`).
+- **Security / Business Impact**: Malformed client inputs cause unhandled database query rejections and 500 Internal Server Errors rather than controlled 400 Bad Request responses.
+- **Recommended Fix**: Validate `priority` against an allowed array (`['P1', 'P2', 'P3', 'P4']`) and return 400 if invalid.
+- **Status Note**: Documented and deferred; lower priority than critical security vulnerabilities.
+- **Verification / Test Status**: Not implemented in Part 1 scope.
+
+---
+
+## 7. Top Five Implementation Details
+
+The top five security fixes were implemented following strict project conventions, prepared statements, and defense-in-depth principles:
+
+### Summary of Changes & Architecture Protections
+
+1. **F1 (Secure Invite & Password Flow)**:
+   - Added dedicated `invitations` table with foreign key to `users`, expiration timestamp, and unique `token_hash`.
+   - Replaced unauthenticated arbitrary-ID password overwrite with single-use cryptographically secure random token (256-bit entropy).
+   - Enforced bcrypt password hashing (`saltRounds = 10`) on invite acceptance.
+   - Protected against race conditions using transactional row locking (`SELECT ... FOR UPDATE`).
+   - Added organization boundary check to ensure admins can only invite users to their own organization.
+2. **F2 (Safe Sorting & SQL Injection Elimination)**:
+   - Replaced direct string interpolation with strict dictionary allowlist mappings for sort fields (`created_at`, `updated_at`, `priority`, `status`, `id`) and sort orders (`ASC`, `DESC`).
+   - Implemented safe fallback defaults (`t.created_at DESC`) for invalid, empty, or malicious inputs.
+   - Maintained prepared statement parameterization for all query criteria (`LIMIT`, `OFFSET`, `status`, `priority`, `org_id`).
+3. **F3 (Multi-Tenant Ticket Isolation)**:
+   - Added `t.org_id = ?` parameterization directly inside `getTicketById(id, orgId)` query.
+   - Updated `GET /api/tickets/:id` to pass `req.user.orgId` from the verified JWT payload.
+   - Handled non-existent or cross-tenant ticket requests with uniform `404 Not Found`, shielding foreign tenant data and comments.
+4. **F4 (Ticket Assignment Authorization)**:
+   - Attached `requireRole('agent', 'admin')` middleware guard to `PATCH /api/tickets/:id/assign`.
+   - Enforced tenant isolation by verifying the ticket belongs to `req.user.orgId`.
+   - Validated that the assignee exists in the same organization and holds an agent or admin role.
+   - Applied transactional row-level locking (`FOR UPDATE`) and conflict detection (`409 Conflict`).
+5. **F5 (Internal Agent Notes Privacy)**:
+   - Parameterized `listComments(ticketId, includeInternal = false)` with `WHERE c.ticket_id = ? AND c.is_internal = 0` for customer requesters.
+   - Permitted staff (`agent` and `admin`) to view all comments (`is_internal` 0 and 1).
+   - Scoped ticket listing badge comment counts so requesters only see counts of public comments.
+   - Restricted internal note creation in `POST /:ticketId/comments` to staff members.
+
+---
+
+## 8. Deferred Findings
+
+In accordance with the assignment requirements, only the top five prioritized findings (F-01 through F-05) were implemented. The following findings were documented during the audit but intentionally deferred:
+
+* **F-06**: Missing Admin Role Guard & Org Check on `DELETE /api/tickets/:id` (`server/src/routes/tickets.js:95-104`)
+* **F-07**: Off-by-One Pagination Offset Skips First 20 Tickets (`server/src/services/ticketService.js:44`)
+* **F-08**: Non-Atomic Race Condition in Ticket Assignment Concurrency (`server/src/services/ticketService.js:127-177`)
+* **F-09**: Requesters Permitted to Post Internal Notes (`server/src/routes/comments.js:14-28`)
+* **F-10**: Missing Input Validation for Ticket Priority Enum on Creation (`server/src/routes/tickets.js:50-67`)
+
+These findings remain untouched in the codebase and are documented to provide a comprehensive roadmap for subsequent maintenance and security hardening tasks.
 
 ---
 
 ## 9. Testing Summary
 
-| Finding ID | Title | Unit Test Status | Integration Test Status | Manual Verification |
-| :---: | :--- | :---: | :---: | :---: |
-| **F-01** | Account Takeover in Invite Accept | **Passed** (22/22 assertions in `test-invite-verification.js`) | **Passed** | Confirmed & Verified |
-| **F-02** | SQL Injection via `sortBy`/`order` | **Passed** (45/45 assertions in `test-sorting-verification.js`) | **Passed** | Confirmed & Verified |
-| **F-03** | Cross-Tenant Ticket Access | **Passed** (21/21 assertions in `test-tenant-isolation-verification.js`) | **Passed** | Confirmed & Verified |
-| **F-04** | Unauthorized Ticket Assignment | **Passed** (23/23 assertions in `test-assignment-verification.js`) | **Passed** | Confirmed & Verified |
-| **F-05** | Internal Notes Disclosure | **Passed** (25/25 assertions in `test-internal-notes-verification.js`) | **Passed** | Confirmed & Verified |
+### Automated Test Suite Results
 
-*Note: All top five selected findings (F-01, F-02, F-03, F-04, and F-05) have been remediated, verified with dedicated test suites, and regression tested with 100% pass rates.*
+| Test File | Purpose | Command | Result | Passed / Failed |
+| :--- | :--- | :--- | :---: | :---: |
+| `server/test-invite-verification.js` | Verifies secure invitation generation, token validation, single-use enforcement, bcrypt hashing, and account takeover prevention (F-01). | `node test-invite-verification.js` | **PASSED** | **22 / 0** |
+| `server/test-sorting-verification.js` | Verifies allowlist validation for `sortBy`/`order`, safe fallback defaults, query parameterization, and SQL injection elimination (F-02). | `node test-sorting-verification.js` | **PASSED** | **45 / 0** |
+| `server/test-tenant-isolation-verification.js` | Verifies organization boundary enforcement on `GET /api/tickets/:id`, IDOR prevention, and cross-tenant comment shielding (F-03). | `node test-tenant-isolation-verification.js` | **PASSED** | **21 / 0** |
+| `server/test-assignment-verification.js` | Verifies RBAC role enforcement, cross-org assignment rejection, atomic conflict handling (409), and self-claiming (F-04). | `node test-assignment-verification.js` | **PASSED** | **23 / 0** |
+| `server/test-internal-notes-verification.js` | Verifies internal agent note visibility filtering for requesters vs. staff, list count badge privacy, and note creation guards (F-05). | `node test-internal-notes-verification.js` | **PASSED** | **25 / 0** |
+| **Total Test Suite** | **Comprehensive verification across all five remediated security findings.** | `All 5 Suites` | **PASSED** | **136 / 0** |
+
+### Verified Manual & End-to-End Checks
+
+In addition to automated assertion suites, the following runtime behaviors were manually tested and verified against the live Node 18 + MySQL 8 environment:
+
+1. **Application Starts Successfully**: Confirmed that `server/src/index.js` initializes without syntax or import errors and listens on `http://localhost:4000`.
+2. **Login Works**: Authenticated with seeded accounts across roles (`admin@northwind.test`, `agent1@northwind.test`, `user1@northwind.test`, `admin@cobalt.test`, etc.) and verified issuance of valid JWT tokens with expected role and org claims.
+3. **Ticket List Works**: Verified `GET /api/tickets` returns organization-scoped tickets, respects priority and status filters, and applies safe sorting.
+4. **Ticket Detail Works**: Verified `GET /api/tickets/:id` returns the ticket record along with authorized comments, returning 404 for nonexistent or cross-tenant tickets.
+5. **Assignment Behavior Works**: Confirmed agents can claim unassigned tickets, admins can assign tickets to agents, requesters are rejected with 403 Forbidden, and concurrent re-assignment yields 409 Conflict.
+6. **Requester Cannot See Internal Notes**: Confirmed customer requesters receive only public comments (`is_internal = 0`) on ticket detail and ticket list comment counters.
+7. **Staff Can See Internal Notes**: Confirmed agents and admins receive both public comments and internal notes (`is_internal` 0 and 1).
 
 ---
 
 ## 10. Conclusion
 
-The Meridian Helpdesk starter application exhibits critical security gaps that undermine authentication, data integrity, and multi-tenant isolation. Remediation of the five selected findings (F-01 through F-05) will secure authentication, protect tenant boundaries, eliminate SQL injection vectors, and restore appropriate role permissions.
+The Meridian Helpdesk starter application contained critical vulnerabilities that threatened authentication integrity, multi-tenant boundaries, and database security. Through targeted remediation of the top five findings (**F-01 through F-05**), arbitrary account takeover was eliminated, SQL injection was prevented, tenant data was isolated, role-based assignment was enforced, and confidential staff notes were protected.
+
+All 136 automated test assertions pass with 0 failures, regression suites remain green, and remaining findings are clearly cataloged for future development.

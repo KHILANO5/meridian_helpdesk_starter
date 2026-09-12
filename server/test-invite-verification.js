@@ -142,7 +142,7 @@ async function runTests() {
       assert(Boolean(validToken) && validToken.length === 64, 'Generated token is a 64-char hex string');
 
       // Check DB: token hash stored, raw token is NOT in DB
-      const [dbRow] = await query('SELECT * FROM invitations WHERE user_id = ?', [invitedUserId]);
+      const [dbRow] = await query('SELECT * FROM invitations WHERE user_id = ? ORDER BY id DESC LIMIT 1', [invitedUserId]);
       assert(Boolean(dbRow), 'Invitation record saved in database');
       assert(dbRow.token_hash !== validToken, 'Database stores token_hash, not the raw token');
       const expectedHash = crypto.createHash('sha256').update(validToken).digest('hex');

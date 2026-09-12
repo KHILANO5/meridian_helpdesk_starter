@@ -1,3 +1,65 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Dependencies
 node_modules/
-dist/
+
+# Logs
 *.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Test and coverage output
+coverage/
+.nyc_output/
+.vitest/
+.junit/
+test-results/
+
+# Build output
+dist/
+build/
+out/
+.next/
+.vite/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Database dumps and local database files
+*.sql.gz
+*.dump
+*.sqlite
+*.sqlite3
+*.db
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local runtime files
+*.pid
+*.pid.lock
+
+# Generated reports and exports
+*.local.pdf
+*.local.docx
+
+# Local machine setup and credential scripts
+setup-db-user.js
+server/scripts/setup-db-user.js

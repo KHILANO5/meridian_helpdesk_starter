@@ -46,10 +46,18 @@ export default function TicketDetail() {
 
   return (
     <div className="ticket-detail">
-      <h1>{ticket.subject}</h1>
+      <h1>
+        {ticket.subject}
+        {Boolean(ticket.breached || ticket.sla?.breached) && (
+          <span className="badge-breached-detail">SLA Breached</span>
+        )}
+      </h1>
       <p className="meta">
         #{ticket.id} · {ticket.status} · {ticket.priority} ·
         requested by {ticket.requester_name} ({ticket.requester_email})
+        {ticket.sla?.deadline && (
+          <span> · SLA Deadline: {new Date(ticket.sla.deadline).toLocaleString()}</span>
+        )}
       </p>
       <p className="body">{ticket.body}</p>
 
