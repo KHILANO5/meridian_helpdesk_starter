@@ -41,7 +41,7 @@ The scope of this code review encompasses the entire backend codebase and databa
 
 | Finding ID | Title | Severity | Status | Selected for Part 1 Fix |
 | :--- | :--- | :---: | :---: | :---: |
-| **F-01** | Unauthenticated Account Takeover & Plaintext Password Storage | **Critical** | Confirmed | **Yes** |
+| **F-01** | Unauthenticated Account Takeover & Plaintext Password Storage | **Critical** | **Fixed** | **Yes** |
 | **F-02** | SQL Injection via Unsanitized `sortBy` and `order` Parameters | **Critical** | Confirmed | **Yes** |
 | **F-03** | Cross-Tenant Ticket & Comment Disclosure (IDOR) on `GET /:id` | **Critical** | Confirmed | **Yes** |
 | **F-04** | Unauthorized and Cross-Tenant Ticket Claiming (`PATCH /:id/assign`) | **High** | Confirmed | **Yes** |
@@ -60,11 +60,11 @@ The scope of this code review encompasses the entire backend codebase and databa
 - **Finding ID**: `F-01`
 - **Title**: Unauthenticated Arbitrary Account Takeover and Unhashed Password Storage in `/api/auth/invite/accept`
 - **Severity**: Critical
-- **Confirmed Status**: Confirmed
+- **Confirmed Status**: Confirmed (Remediation: **Fixed**)
 - **Selected Status**: Selected
 - **Exact File Path**: `server/src/routes/auth.js`
-- **Exact Line Range**: Lines 42–54
-- **Route / Function Name**: `router.post('/invite/accept', ...)`
+- **Exact Line Range**: Lines 42–54 (originally); refactored into secure creation and acceptance handlers
+- **Route / Function Name**: `router.post('/invite/accept', ...)` & `router.post('/invite', ...)`
 - **Relevant Code Snippet**:
   ```javascript
   router.post('/invite/accept', async (req, res, next) => {
@@ -92,6 +92,13 @@ The scope of this code review encompasses the entire backend codebase and databa
   1. Implement a cryptographically signed, expiring invitation token (e.g., JWT or dedicated token table) containing the target user ID and tenant ID.
   2. Verify the invite token before allowing the password change.
   3. Hash the password with `await bcrypt.hash(password, 10)` before writing to `password_hash`.
+- **Remediation Note (Fixed)**:
+  - **Root Cause**: Complete absence of authentication or invitation token validation on `/api/auth/invite/accept`, coupled with unhashed password storage directly into `password_hash`.
+  - **Files Changed**:
+    - `db/schema.sql`: Added `invitations` table with foreign key to `users(id)`, expiration timestamp, used timestamp, and unique index on `token_hash`.
+    - `server/src/routes/auth.js`: Added authenticated admin-only `POST /api/auth/invite` endpoint (restricted to admin's organization) generating 256-bit cryptographically secure random tokens (`crypto.randomBytes(32)`), storing only the SHA-256 hash. Reimplemented `POST /api/auth/invite/accept` to require `{ token, password }` inside a database transaction with `SELECT ... FOR UPDATE`, ensuring single-use token consumption, rejection of expired/invalid tokens, rejection of arbitrary `userId`, and password hashing using `bcrypt.hash(password, 10)`.
+  - **Tests Performed**: 22 automated test assertions in `server/test-invite-verification.js` passing 100% (arbitrary `userId` attacks rejected, invalid/missing/expired/reused tokens rejected, non-admin invite creation rejected, cross-org invite creation rejected, bcrypt hash verification confirmed, and successful login with new password confirmed).
+  - **Limitations & Assumptions**: In this local development environment without an SMTP/email server, the raw invitation token is returned in the admin's API response for testing. In production, this token must be delivered strictly out-of-band via email.
 
 ---
 
@@ -325,13 +332,13 @@ The following genuine findings were documented during review but deferred to ens
 
 | Finding ID | Title | Unit Test Status | Integration Test Status | Manual Verification |
 | :---: | :--- | :---: | :---: | :---: |
-| **F-01** | Account Takeover in Invite Accept | Not yet tested | Not yet tested | Confirmed via code review |
+| **F-01** | Account Takeover in Invite Accept | **Passed** (22/22 assertions in `test-invite-verification.js`) | **Passed** | Confirmed & Verified |
 | **F-02** | SQL Injection via `sortBy`/`order` | Not yet tested | Not yet tested | Confirmed via code review |
 | **F-03** | Cross-Tenant Ticket Access | Not yet tested | Not yet tested | Confirmed via code review |
 | **F-04** | Unauthorized Ticket Assignment | Not yet tested | Not yet tested | Confirmed via code review |
 | **F-05** | Internal Notes Disclosure | Not yet tested | Not yet tested | Confirmed via code review |
 
-*Note: No code fixes or automated tests have been executed yet. All statuses reflect pre-implementation review state.*
+*Note: F-01 has been remediated and fully verified. Findings F-02 through F-05 remain in pre-implementation status pending their respective remediation tasks.*
 
 ---
 

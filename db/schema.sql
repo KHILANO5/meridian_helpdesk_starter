@@ -3,6 +3,7 @@
 
 DROP TABLE IF EXISTS comments;
 DROP TABLE IF EXISTS tickets;
+DROP TABLE IF EXISTS invitations;
 DROP TABLE IF EXISTS users;
 DROP TABLE IF EXISTS organizations;
 
@@ -25,6 +26,19 @@ CREATE TABLE users (
   UNIQUE KEY uq_users_email (email),
   KEY idx_users_org (org_id),
   CONSTRAINT fk_users_org FOREIGN KEY (org_id) REFERENCES organizations (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE invitations (
+  id          INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id     INT UNSIGNED NOT NULL,
+  token_hash  VARCHAR(64) NOT NULL,
+  expires_at  DATETIME NOT NULL,
+  used_at     DATETIME DEFAULT NULL,
+  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_invitations_token_hash (token_hash),
+  KEY idx_invitations_user (user_id),
+  CONSTRAINT fk_invitations_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE tickets (
