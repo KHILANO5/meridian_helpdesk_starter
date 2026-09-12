@@ -43,7 +43,7 @@ The scope of this code review encompasses the entire backend codebase and databa
 | :--- | :--- | :---: | :---: | :---: |
 | **F-01** | Unauthenticated Account Takeover & Plaintext Password Storage | **Critical** | **Fixed** | **Yes** |
 | **F-02** | SQL Injection via Unsanitized `sortBy` and `order` Parameters | **Critical** | **Fixed** | **Yes** |
-| **F-03** | Cross-Tenant Ticket & Comment Disclosure (IDOR) on `GET /:id` | **Critical** | Confirmed | **Yes** |
+| **F-03** | Cross-Tenant Ticket & Comment Disclosure (IDOR) on `GET /:id` | **Critical** | **Fixed** | **Yes** |
 | **F-04** | Unauthorized and Cross-Tenant Ticket Claiming (`PATCH /:id/assign`) | **High** | Confirmed | **Yes** |
 | **F-05** | Internal Agent Notes (`is_internal`) Leaked to Requesters | **High** | Confirmed | **Yes** |
 | **F-06** | Missing Admin Role Guard & Org Check on `DELETE /api/tickets/:id` | **High** | Confirmed | No |
@@ -185,13 +185,14 @@ The scope of this code review encompasses the entire backend codebase and databa
 - **Finding ID**: `F-03`
 - **Title**: Cross-Tenant Ticket & Comment Disclosure (IDOR) on `GET /api/tickets/:id`
 - **Severity**: Critical
-- **Confirmed Status**: Confirmed
+- **Confirmed Status**: Confirmed (Remediation: **Fixed**)
 - **Selected Status**: Selected
-- **Exact File Path**: `server/src/routes/tickets.js`
-- **Exact Line Range**: Lines 31–41
-- **Route / Function Name**: `router.get('/:id', ...)`
+- **Exact File Path**: `server/src/routes/tickets.js` & `server/src/services/ticketService.js`
+- **Exact Line Range**: `tickets.js` (Lines 31–43) & `ticketService.js` (Lines 76–90)
+- **Route / Function Name**: `router.get('/:id', ...)` & `getTicketById(id, orgId)`
 - **Relevant Code Snippet**:
   ```javascript
+  // server/src/routes/tickets.js (original vulnerable handler)
   router.get('/:id', requireAuth, async (req, res, next) => {
     try {
       const ticket = await getTicketById(Number(req.params.id));
@@ -205,13 +206,13 @@ The scope of this code review encompasses the entire backend codebase and databa
   });
   ```
 - **Problem Explanation**: 
-  When a user requests a specific ticket by ID, the route queries `getTicketById(id)` but never checks if `ticket.org_id === req.user.orgId`. 
+  When a user requested a specific ticket by ID, the route queried `getTicketById(id)` without verifying that `ticket.org_id === req.user.orgId`.
 - **Security / Business Impact**: 
-  Direct Object Reference (IDOR) vulnerability violating the fundamental multi-tenant isolation requirement of the application. Any user belonging to *Cobalt Logistics* can view confidential support tickets and customer communications belonging to *Northwind Trading*.
+  Direct Object Reference (IDOR) vulnerability violating the fundamental multi-tenant isolation requirement of the application. Any user belonging to *Cobalt Logistics* could view confidential support tickets and customer communications belonging to *Northwind Trading*.
 - **Safe Reproduction Steps**:
   1. Log in as `user1@cobalt.test` (Organization 2).
   2. Send a `GET /api/tickets/1` request (where ticket ID 1 belongs to Organization 1).
-  3. The server returns `200 OK` with the full ticket subject, description, requester email, and all comments from Organization 1.
+  3. The server previously returned `200 OK` with the full ticket subject, description, requester email, and all comments from Organization 1.
 - **Recommended Fix**:
   Enforce tenant ownership verification before returning ticket data:
   ```javascript
@@ -220,6 +221,20 @@ The scope of this code review encompasses the entire backend codebase and databa
     return res.status(404).json({ error: 'Not found' });
   }
   ```
+- **Remediation Note (Fixed)**:
+  - **Root Cause**: `getTicketById` only filtered by `t.id = ?` without an organization boundary condition, allowing any authenticated user to fetch tickets and comments from foreign tenants via IDOR.
+  - **Exact Files Changed**:
+    - `server/src/services/ticketService.js`: Updated `getTicketById(id, orgId)` to add parameterized `t.org_id = ?` directly in the database SQL query whenever `orgId` is supplied.
+    - `server/src/routes/tickets.js`: Updated `GET /api/tickets/:id` to validate numeric ID format and pass `req.user.orgId` directly to `getTicketById(ticketId, req.user.orgId)`. If no matching ticket exists in the user's organization, the route immediately returns safe `404 Not Found` without fetching comments.
+  - **Authorization Condition**: `t.id = ? AND t.org_id = ?` enforced at the database layer via prepared statement parameters `[id, orgId]`.
+  - **Actual Tests Run**: Executed automated test suite `server/test-tenant-isolation-verification.js` covering 21 assertions:
+    - Same-organization ticket access confirmed (200 OK with authorized ticket and comments).
+    - Cross-tenant ticket request from Northwind user to Cobalt ticket returns 404 Not Found without leaking ticket details or comments.
+    - Reverse cross-tenant check from Cobalt user to Northwind ticket returns 404 Not Found, while access to own Cobalt ticket returns 200 OK.
+    - Missing and invalid authentication headers rejected with 401 Unauthorized.
+    - Nonexistent and malformed ticket IDs return safe 404 responses.
+    - Regressions verified: Finding 1 (22/22 passed) and Finding 2 (45/45 passed).
+  - **Actual Test Results**: 21 passed, 0 failed.
 
 ---
 
@@ -361,11 +376,11 @@ The following genuine findings were documented during review but deferred to ens
 | :---: | :--- | :---: | :---: | :---: |
 | **F-01** | Account Takeover in Invite Accept | **Passed** (22/22 assertions in `test-invite-verification.js`) | **Passed** | Confirmed & Verified |
 | **F-02** | SQL Injection via `sortBy`/`order` | **Passed** (45/45 assertions in `test-sorting-verification.js`) | **Passed** | Confirmed & Verified |
-| **F-03** | Cross-Tenant Ticket Access | Not yet tested | Not yet tested | Confirmed via code review |
+| **F-03** | Cross-Tenant Ticket Access | **Passed** (21/21 assertions in `test-tenant-isolation-verification.js`) | **Passed** | Confirmed & Verified |
 | **F-04** | Unauthorized Ticket Assignment | Not yet tested | Not yet tested | Confirmed via code review |
 | **F-05** | Internal Notes Disclosure | Not yet tested | Not yet tested | Confirmed via code review |
 
-*Note: F-01 and F-02 have been remediated and fully verified. Findings F-03 through F-05 remain in pre-implementation status pending their respective remediation tasks.*
+*Note: F-01, F-02, and F-03 have been remediated and fully verified. Findings F-04 and F-05 remain in pre-implementation status pending their respective remediation tasks.*
 
 ---
 

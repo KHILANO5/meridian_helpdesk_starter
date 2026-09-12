@@ -73,14 +73,22 @@ export async function listTickets({ orgId, page = 1, search = '', status, priori
   return { rows, total, page, pageSize: PAGE_SIZE };
 }
 
-export async function getTicketById(id) {
+export async function getTicketById(id, orgId) {
+  const where = ['t.id = ?'];
+  const params = [id];
+
+  if (orgId !== undefined && orgId !== null) {
+    where.push('t.org_id = ?');
+    params.push(orgId);
+  }
+
   const rows = await query(
     `SELECT t.*, u.name AS assignee_name, r.name AS requester_name, r.email AS requester_email
        FROM tickets t
        LEFT JOIN users u ON u.id = t.assignee_id
        JOIN users r ON r.id = t.requester_id
-      WHERE t.id = ?`,
-    [id]
+      WHERE ${where.join(' AND ')}`,
+    params
   );
   return rows[0] || null;
 }
