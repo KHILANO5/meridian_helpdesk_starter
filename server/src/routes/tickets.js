@@ -64,10 +64,23 @@ router.post('/', requireAuth, async (req, res, next) => {
   }
 });
 
-router.patch('/:id/assign', requireAuth, async (req, res, next) => {
+router.patch('/:id/assign', requireAuth, requireRole('agent', 'admin'), async (req, res, next) => {
   try {
-    const result = await assignTicket(Number(req.params.id), req.user.id);
+    const ticketId = Number(req.params.id);
+    if (!Number.isInteger(ticketId) || ticketId <= 0) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    const assigneeId = req.body?.assigneeId !== undefined ? Number(req.body.assigneeId) : req.user.id;
+    if (!Number.isInteger(assigneeId) || assigneeId <= 0) {
+      return res.status(400).json({ error: 'Invalid assignee ID' });
+    }
+
+    const result = await assignTicket(ticketId, assigneeId, req.user.orgId);
     if (!result) return res.status(404).json({ error: 'Not found' });
+    if (result.invalidAssignee) {
+      return res.status(400).json({ error: 'Assignee must be an agent or admin in the same organization' });
+    }
     if (result.conflict) {
       return res.status(409).json({ error: 'Ticket already assigned', ticket: result.ticket });
     }

@@ -44,7 +44,7 @@ The scope of this code review encompasses the entire backend codebase and databa
 | **F-01** | Unauthenticated Account Takeover & Plaintext Password Storage | **Critical** | **Fixed** | **Yes** |
 | **F-02** | SQL Injection via Unsanitized `sortBy` and `order` Parameters | **Critical** | **Fixed** | **Yes** |
 | **F-03** | Cross-Tenant Ticket & Comment Disclosure (IDOR) on `GET /:id` | **Critical** | **Fixed** | **Yes** |
-| **F-04** | Unauthorized and Cross-Tenant Ticket Claiming (`PATCH /:id/assign`) | **High** | Confirmed | **Yes** |
+| **F-04** | Unauthorized and Cross-Tenant Ticket Claiming (`PATCH /:id/assign`) | **High** | **Fixed** | **Yes** |
 | **F-05** | Internal Agent Notes (`is_internal`) Leaked to Requesters | **High** | Confirmed | **Yes** |
 | **F-06** | Missing Admin Role Guard & Org Check on `DELETE /api/tickets/:id` | **High** | Confirmed | No |
 | **F-07** | Off-by-One Pagination Offset Skips First 20 Tickets (Page 1) | **High** | Confirmed | No |
@@ -242,15 +242,15 @@ The scope of this code review encompasses the entire backend codebase and databa
 - **Finding ID**: `F-04`
 - **Title**: Unauthorized and Cross-Tenant Ticket Assignment via `PATCH /api/tickets/:id/assign`
 - **Severity**: High
-- **Confirmed Status**: Confirmed
+- **Confirmed Status**: Confirmed (Remediation: **Fixed**)
 - **Selected Status**: Selected
 - **Exact File Paths & Lines**: 
-  - `server/src/routes/tickets.js` (Lines 62–73)
-  - `server/src/services/ticketService.js` (Lines 89–102)
+  - `server/src/routes/tickets.js` (Lines 67–85)
+  - `server/src/services/ticketService.js` (Lines 115–165)
 - **Route / Function Name**: `router.patch('/:id/assign', ...)` / `assignTicket()`
 - **Relevant Code Snippet**:
   ```javascript
-  // server/src/routes/tickets.js
+  // server/src/routes/tickets.js (original vulnerable handler)
   router.patch('/:id/assign', requireAuth, async (req, res, next) => {
     try {
       const result = await assignTicket(Number(req.params.id), req.user.id);
@@ -265,14 +265,15 @@ The scope of this code review encompasses the entire backend codebase and databa
   });
   ```
 - **Problem Explanation**: 
-  1. The route only specifies `requireAuth` and lacks role authorization (`requireRole('agent', 'admin')`). A standard customer `requester` can claim tickets.
-  2. `assignTicket()` does not verify whether `ticket.org_id === req.user.orgId`. An agent from Organization B can assign themselves to a ticket belonging to Organization A.
+  1. The route originally only specified `requireAuth` and lacked role authorization (`requireRole('agent', 'admin')`), allowing standard customer `requester` users to claim tickets.
+  2. `assignTicket()` did not verify whether `ticket.org_id === req.user.orgId`, enabling agents from Organization B to claim tickets belonging to Organization A.
+  3. No validation was performed on the target assignee's organization or role.
 - **Security / Business Impact**: 
-  Unauthorized role elevation and cross-tenant data modification. Requesters can assign tickets to themselves, and external agents can manipulate another organization's ticket workflow.
+  Unauthorized role elevation and cross-tenant data modification. Requesters could assign tickets to themselves, and external agents could manipulate another organization's ticket workflow.
 - **Safe Reproduction Steps**:
   1. Log in as `user1@northwind.test` (role: `requester`).
   2. Issue a `PATCH /api/tickets/<unassigned_id>/assign` request.
-  3. The requester becomes the ticket's assignee and the ticket status changes to `pending`.
+  3. The requester previously became the ticket's assignee and the ticket status changed to `pending`.
 - **Recommended Fix**:
   1. Add `requireRole('agent', 'admin')` middleware to the route.
   2. Verify tenant ownership before executing assignment:
@@ -285,6 +286,28 @@ The scope of this code review encompasses the entire backend codebase and databa
     const result = await assignTicket(ticket.id, req.user.id);
     ...
   ```
+- **Remediation Note (Fixed)**:
+  - **Root Cause**: Missing RBAC guard (`requireRole('agent', 'admin')`) on `PATCH /api/tickets/:id/assign`, lack of tenant validation against `req.user.orgId`, and absence of assignee verification.
+  - **Exact Files Changed**:
+    - `server/src/routes/tickets.js`: Added `requireRole('agent', 'admin')` middleware guard. Validated ticket ID and optional `assigneeId` parameter (defaulting to `req.user.id` for self-claim). Passed `req.user.orgId` to `assignTicket`.
+    - `server/src/services/ticketService.js`: Reimplemented `assignTicket(ticketId, assigneeId, orgId)` using a database transaction with `SELECT ... FOR UPDATE` row-level locking. Enforced that the ticket belongs to `orgId`, verified that the assignee exists in `orgId` and holds an `agent` or `admin` role, detected existing assignment conflicts atomically (`409 Conflict`), and updated the ticket's `assignee_id` and `status` to `pending`.
+  - **Exact Authorization Rules Implemented**:
+    - Callers must have role `agent` or `admin` (enforced via `requireRole('agent', 'admin')`). Requesters receive `403 Forbidden`.
+    - Ticket must belong to the caller's organization (`ticket.org_id === req.user.orgId`). Cross-org attempts return `404 Not Found`.
+    - Target assignee must belong to the same organization (`assignee.org_id === orgId`) and have role `agent` or `admin`. Cross-org or requester assignees return `400 Bad Request`.
+  - **Actual Tests Run**: Executed automated test suite `server/test-assignment-verification.js` covering 23 assertions:
+    - Unauthenticated requests rejected with 401.
+    - Requester role assignment attempts rejected with 403 Forbidden.
+    - Cross-tenant ticket assignment attempts return 404 Not Found.
+    - Assigning to a user from another organization rejected with 400 Bad Request.
+    - Assigning to a requester rejected with 400 Bad Request.
+    - Nonexistent or malformed assignee IDs rejected with 400.
+    - Invalid ticket IDs return safe 404 response.
+    - Authorized agent self-claiming within same org succeeds with 200 OK (assignee and pending status updated in DB).
+    - Claiming an already assigned ticket returns 409 Conflict with conflict payload.
+    - Admin assigning ticket to another agent in same organization succeeds with 200 OK.
+    - Regressions verified: Finding 1 (22/22 passed), Finding 2 (45/45 passed), and Finding 3 (21/21 passed).
+  - **Actual Test Results**: 23 passed, 0 failed.
 
 ---
 
@@ -377,10 +400,10 @@ The following genuine findings were documented during review but deferred to ens
 | **F-01** | Account Takeover in Invite Accept | **Passed** (22/22 assertions in `test-invite-verification.js`) | **Passed** | Confirmed & Verified |
 | **F-02** | SQL Injection via `sortBy`/`order` | **Passed** (45/45 assertions in `test-sorting-verification.js`) | **Passed** | Confirmed & Verified |
 | **F-03** | Cross-Tenant Ticket Access | **Passed** (21/21 assertions in `test-tenant-isolation-verification.js`) | **Passed** | Confirmed & Verified |
-| **F-04** | Unauthorized Ticket Assignment | Not yet tested | Not yet tested | Confirmed via code review |
+| **F-04** | Unauthorized Ticket Assignment | **Passed** (23/23 assertions in `test-assignment-verification.js`) | **Passed** | Confirmed & Verified |
 | **F-05** | Internal Notes Disclosure | Not yet tested | Not yet tested | Confirmed via code review |
 
-*Note: F-01, F-02, and F-03 have been remediated and fully verified. Findings F-04 and F-05 remain in pre-implementation status pending their respective remediation tasks.*
+*Note: F-01, F-02, F-03, and F-04 have been remediated and fully verified. Finding F-05 remains in pre-implementation status pending its respective remediation task.*
 
 ---
 

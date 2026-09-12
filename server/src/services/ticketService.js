@@ -1,4 +1,4 @@
-import { query } from '../db/pool.js';
+import { pool, query } from '../db/pool.js';
 
 const PAGE_SIZE = 20;
 
@@ -113,19 +113,56 @@ export async function createTicket({ orgId, subject, body, priority, requesterId
   return getTicketById(result.insertId);
 }
 
-export async function assignTicket(ticketId, assigneeId) {
-  const ticket = await getTicketById(ticketId);
-  if (!ticket) return null;
+export async function assignTicket(ticketId, assigneeId, orgId) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
 
-  if (ticket.assignee_id) {
-    return { conflict: true, ticket };
+    // Lock ticket row FOR UPDATE scoped to the organization
+    const [rows] = await conn.query(
+      'SELECT * FROM tickets WHERE id = ? AND org_id = ? FOR UPDATE',
+      [ticketId, orgId]
+    );
+    const ticket = rows[0];
+    if (!ticket) {
+      await conn.rollback();
+      return null;
+    }
+
+    // Check if already assigned
+    if (ticket.assignee_id) {
+      await conn.rollback();
+      const currentTicket = await getTicketById(ticketId, orgId);
+      return { conflict: true, ticket: currentTicket };
+    }
+
+    // Validate that assignee belongs to the same organization and has agent/admin role
+    const [userRows] = await conn.query(
+      'SELECT id, name, role, org_id FROM users WHERE id = ?',
+      [assigneeId]
+    );
+    const agent = userRows[0];
+    if (!agent || agent.org_id !== orgId || (agent.role !== 'agent' && agent.role !== 'admin')) {
+      await conn.rollback();
+      return { invalidAssignee: true };
+    }
+
+    // Atomically assign ticket and transition status to pending
+    await conn.query(
+      'UPDATE tickets SET assignee_id = ?, status = ? WHERE id = ? AND org_id = ?',
+      [assigneeId, 'pending', ticketId, orgId]
+    );
+
+    await conn.commit();
+
+    const updatedTicket = await getTicketById(ticketId, orgId);
+    return { conflict: false, assignedTo: agent, ticket: updatedTicket };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
   }
-
-  // Look up the agent so the response carries a display name for the toast.
-  const [agent] = await query('SELECT id, name FROM users WHERE id = ?', [assigneeId]);
-
-  await query('UPDATE tickets SET assignee_id = ?, status = ? WHERE id = ?', [assigneeId, 'pending', ticketId]);
-  return { conflict: false, assignedTo: agent, ticket: await getTicketById(ticketId) };
 }
 
 export async function deleteTicket(id) {
